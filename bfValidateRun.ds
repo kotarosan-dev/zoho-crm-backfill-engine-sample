@@ -1,0 +1,273 @@
+string standalone.bf_validateRun(String runIdText)
+{
+// Backfill engine - Run validator (standalone) DRAFT v1, 2026-11-11 (Phase 2)
+// READ ONLY: no record is created or updated anywhere. Returns a multi-line summary.
+// Checks:
+//   status       Status is one of the 13 dictionary values
+//   version      code version constant for the rule == Run.Rule_Version
+//   fingerprint  recomputed with the Runner formula (v1.3 / v2.0):
+//                Rule_ID + "|" + Rule_Version + "|" + Boundary_Max_ID + "|" + Effective_Date (yyyy-MM-dd)
+//   counts       Success + Failure + Skipped == Evaluated, where Skipped = NoChange + Stale + Missing
+//                (the Runner counts EXCLUDED records with NoChange, so the identity holds for every rule)
+//   freshness    DryRun_At within 7 days of today (JST, whole days). Counted as an issue only while the
+//                Run waits for approval (DryRunDone). Retry Runs have no dry run of their own: N/A.
+//   lock         Lock_Token empty. A held lock is an issue unless Status is Running.
+// Rule version constants: keep identical in bfRunnerCore, bfValidateRun and bfApproveRun.
+// Note: Zoho may drop underscores from displayed return strings (knowledge base 5.2).
+	verL1 = "L1-v1";
+	verL2 = "L2-v1";
+	verD1 = "D1-v1";
+	freshDays = 7;
+	runId = runIdText.toLong();
+	run = zoho.crm.getRecordById("Backfill_Runs",runId);
+	if(run == null)
+	{
+		return "ERROR: run not found";
+	}
+	// Corrected today (JST), same method as the Runner
+	rawNow = zoho.currenttime;
+	wallDate = rawNow.toDate();
+	wallYear = wallDate.toString("yyyy");
+	marBase = (wallYear + "-03-01").toDate();
+	dstStart = marBase;
+	novBase = (wallYear + "-11-01").toDate();
+	dstEnd = novBase;
+	probeSteps = {0,1,2,3,4,5,6};
+	for each ps in probeSteps
+	{
+		if(marBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstStart = marBase.addDay(ps).addDay(7);
+			break;
+		}
+	}
+	for each ps in probeSteps
+	{
+		if(novBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstEnd = novBase.addDay(ps);
+			break;
+		}
+	}
+	shiftHours = 17;
+	if(wallDate >= dstStart && wallDate < dstEnd)
+	{
+		shiftHours = 16;
+	}
+	todayText = rawNow.addHour(shiftHours).toDate().toString("yyyy-MM-dd");
+	issues = 0;
+	out = "VALIDATE run " + runIdText + " (" + ifnull(run.get("Name"),"").toString() + ") at JST date " + todayText;
+	// Status
+	status = ifnull(run.get("Status"),"").toString();
+	validStatuses = {"Draft","DryRunning","DryRunDone","Queued","Running","Paused_Budget","Paused_RateLimit","Paused_Manual","Paused_Failure","Failed","Completed","CompletedWithErrors","Cancelled"};
+	if(validStatuses.contains(status))
+	{
+		out = out + "\nstatus: " + status;
+	}
+	else
+	{
+		issues = issues + 1;
+		out = out + "\nstatus: NG unknown value [" + status + "]";
+	}
+	runType = ifnull(run.get("Run_Type"),"").toString();
+	ruleId = ifnull(run.get("Rule_ID"),"").toString();
+	moduleName = ifnull(run.get("Target_Module"),"").toString();
+	out = out + "\nrule: " + ruleId + " / module: " + moduleName + " / run type: " + runType;
+	// Version
+	codeVersion = "";
+	expectedModule = "";
+	if(ruleId == "L1")
+	{
+		codeVersion = verL1;
+		expectedModule = "Leads";
+	}
+	else if(ruleId == "L2")
+	{
+		codeVersion = verL2;
+		expectedModule = "Leads";
+	}
+	else if(ruleId == "D1")
+	{
+		codeVersion = verD1;
+		expectedModule = "Deals";
+	}
+	runVersion = ifnull(run.get("Rule_Version"),"").toString();
+	if(codeVersion == "")
+	{
+		issues = issues + 1;
+		out = out + "\nversion: NG unknown rule [" + ruleId + "]";
+	}
+	else if(runVersion == codeVersion)
+	{
+		out = out + "\nversion: OK (code " + codeVersion + " = run " + runVersion + ")";
+	}
+	else
+	{
+		issues = issues + 1;
+		out = out + "\nversion: NG (code " + codeVersion + " vs run " + runVersion + ")";
+	}
+	if(moduleName != "" && expectedModule != "" && moduleName != expectedModule)
+	{
+		issues = issues + 1;
+		out = out + "\nmodule: NG (rule expects " + expectedModule + ")";
+	}
+	// Fingerprint (same formula as the Runner)
+	boundary = "";
+	if(run.get("Boundary_Max_ID") != null)
+	{
+		boundary = run.get("Boundary_Max_ID").toString();
+	}
+	effectiveText = "";
+	if(run.get("Effective_Date") != null)
+	{
+		try
+		{
+			effectiveText = run.get("Effective_Date").toString().toDate().toString("yyyy-MM-dd");
+		}
+		catch (e1)
+		{
+			effectiveText = run.get("Effective_Date").toString().subString(0,10);
+		}
+	}
+	storedFp = ifnull(run.get("Config_Fingerprint"),"").toString();
+	expectedFp = ruleId + "|" + runVersion + "|" + boundary + "|" + effectiveText;
+	if(storedFp == "")
+	{
+		if(status == "Draft" || status == "DryRunning")
+		{
+			out = out + "\nfingerprint: not yet frozen (dry run not finished)";
+		}
+		else
+		{
+			issues = issues + 1;
+			out = out + "\nfingerprint: NG empty after the dry run stage (expected " + expectedFp + ")";
+		}
+	}
+	else if(storedFp == expectedFp)
+	{
+		out = out + "\nfingerprint: OK " + storedFp;
+	}
+	else
+	{
+		issues = issues + 1;
+		out = out + "\nfingerprint: NG stored " + storedFp + " vs recomputed " + expectedFp;
+	}
+	// Counts
+	cEval = ifnull(run.get("Evaluated_Count"),0).toLong();
+	cSuccess = ifnull(run.get("Success_Count"),0).toLong();
+	cFailure = ifnull(run.get("Failure_Count"),0).toLong();
+	cNoChange = ifnull(run.get("Skipped_NoChange_Count"),0).toLong();
+	cStale = ifnull(run.get("Skipped_Stale_Count"),0).toLong();
+	cMissing = ifnull(run.get("Missing_Count"),0).toLong();
+	cSkipped = cNoChange + cStale + cMissing;
+	cSum = cSuccess + cFailure + cSkipped;
+	countLine = "evaluated=" + cEval.toString() + " success=" + cSuccess.toString() + " failure=" + cFailure.toString() + " skipped=" + cSkipped.toString() + " (nochange=" + cNoChange.toString() + " stale=" + cStale.toString() + " missing=" + cMissing.toString() + ")";
+	if(cSum == cEval)
+	{
+		out = out + "\ncounts: OK " + countLine;
+	}
+	else
+	{
+		issues = issues + 1;
+		out = out + "\ncounts: NG sum " + cSum.toString() + " != evaluated; " + countLine;
+	}
+	dEval = ifnull(run.get("DryRun_Evaluated"),0).toLong();
+	dChanged = ifnull(run.get("DryRun_Changed"),0).toLong();
+	out = out + "\ndry run record: evaluated=" + dEval.toString() + " changed=" + dChanged.toString();
+	// Dry run freshness (whole JST days)
+	dryAtText = "";
+	if(run.get("DryRun_At") != null)
+	{
+		dryAtText = run.get("DryRun_At").toString();
+	}
+	if(runType == "Retry")
+	{
+		out = out + "\nfreshness: N/A (Retry run inherits the approved configuration of the original run)";
+	}
+	else if(dryAtText.length() < 10)
+	{
+		if(status == "DryRunDone")
+		{
+			issues = issues + 1;
+			out = out + "\nfreshness: NG no DryRun At recorded";
+		}
+		else
+		{
+			out = out + "\nfreshness: no DryRun At recorded";
+		}
+	}
+	else
+	{
+		ageOk = false;
+		ageText = "?";
+		try
+		{
+			dryDate = dryAtText.subString(0,10).toDate();
+			todayDate = todayText.toDate();
+			ageDays = ((todayDate.toLong() - dryDate.toLong()) / 86400000).floor();
+			ageText = ageDays.toLong().toString();
+			if(ageDays >= 0 && ageDays <= freshDays)
+			{
+				ageOk = true;
+			}
+		}
+		catch (e2)
+		{
+			ageOk = false;
+		}
+		if(ageOk)
+		{
+			out = out + "\nfreshness: OK dry run at " + dryAtText + ", age " + ageText + " days (limit 7)";
+		}
+		else if(status == "DryRunDone")
+		{
+			issues = issues + 1;
+			out = out + "\nfreshness: NG dry run at " + dryAtText + ", age " + ageText + " days (limit 7); run a new dry run";
+		}
+		else
+		{
+			out = out + "\nfreshness: info dry run at " + dryAtText + ", age " + ageText + " days (limit 7 applies to approval only)";
+		}
+	}
+	// Lock
+	lockVal = ifnull(run.get("Lock_Token"),"").toString();
+	if(lockVal == "")
+	{
+		out = out + "\nlock: free";
+	}
+	else if(status == "Running")
+	{
+		out = out + "\nlock: held by " + lockVal + " (Running)";
+	}
+	else
+	{
+		issues = issues + 1;
+		out = out + "\nlock: NG held by " + lockVal + " while status is " + status + " (stale lock? use control action clearlock)";
+	}
+	// Pending ids (Retry Run)
+	pendingText = ifnull(run.get("Pending_IDs"),"").toString().trim();
+	if(pendingText != "")
+	{
+		pendingCount = pendingText.toList(",").size();
+		out = out + "\npending ids: " + pendingCount.toString();
+	}
+	errSum = ifnull(run.get("Error_Summary"),"").toString();
+	if(errSum != "")
+	{
+		errLen = errSum.length();
+		if(errLen > 300)
+		{
+			errSum = "..." + errSum.subString(errLen - 300,errLen);
+		}
+		out = out + "\nerror summary (tail): " + errSum;
+	}
+	if(issues == 0)
+	{
+		out = out + "\nVERDICT: OK";
+	}
+	else
+	{
+		out = out + "\nVERDICT: NG issues=" + issues.toString();
+	}
+	return out;
+}

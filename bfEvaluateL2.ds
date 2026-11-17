@@ -1,0 +1,183 @@
+string standalone.bf_evaluateL2(String registeredDateText, String leadStatusText, String effectiveDateText, String currentFlagText, String currentReasonText)
+{
+// Backfill engine - rule L2 evaluator (standalone) DRAFT L2-v1, 2026-11-11 (Phase 2)
+// Spec v0.2 sections 4, 13.3 and TC-11. Pure evaluation only: no API calls, no writes.
+// Rule L2 (Leads, stale re-flag):
+//   input  = BF_Registered_Date (business date) and Lead_Status.
+//            Last_Activity_Time is NOT used: Phase 0 B5 measured that our own BF writes move it.
+//   stale  = days since registration > 90 (exactly 90 days is NOT stale)
+//            and Lead_Status is not in the fixed terminal list.
+//   terminal list = 失注 / 無効 / 精査済み（対象外） (the org's Lead_Status values are Japanese;
+//            confirmed against the real values of the author's org on 2026-11-12).
+//   writes = BF_Stale_Flag (checkbox) and BF_Stale_Reason (single line, English).
+//   Two-way re-flag: a record that is no longer stale is cleared to false / "" (counts as a change).
+// Arguments are primitive strings:
+//   registeredDateText yyyy-MM-dd (a longer ISO text is cut to its first 10 characters)
+//   leadStatusText     picklist value or ""
+//   effectiveDateText  yyyy-MM-dd (Run.Effective_Date)
+//   currentFlagText    "true" / "false" / ""
+//   currentReasonText  current BF_Stale_Reason or ""
+// Return = the Map below, returned as its String form (result.toString()) because standalone functions
+// return String only: a Map declaration was refused on save with "Invalid return Type Map. Category
+// standalone returns string" (measured 2026-11-12, knowledge base 5.2).
+// Callers must apply .toMap() to the returned text before reading the keys.
+// Return Map keys (after .toMap()):
+//   change  boolean, true when the target values differ from the current values
+//   outcome "CHANGE" / "NOCHANGE" / "EXCLUDED"
+//   writes  Map of field API name to value; an empty Map unless change is true
+//   detail  short text for the ledger (Backfill_Logs Proposed_Detail)
+// EXCLUDED = cannot be evaluated (registered date or effective date empty or invalid). Nothing is written.
+// A current state of flag false + empty reason equals "not stale", so never-flagged leads are not rewritten.
+// Day difference uses the same method as bf_evaluateL1 / Runner v1.3 (toLong() / 86400000 then floor),
+// which Phase 1 measured on the boundary fixtures 0/30/31/90/91/365/366.
+// Deluge constraints applied: no while, no C-style for, no ternary, comments on their own lines only.
+// Related: standalone.bf_runnerCore (caller, v2.0), standalone.bf_evaluateD1 (same style).
+	terminalStatuses = {"失注","無効","精査済み（対象外）"};
+	staleThresholdDays = 90;
+	result = Map();
+	result.put("change",false);
+	result.put("outcome","EXCLUDED");
+	result.put("writes",Map());
+	result.put("detail","");
+	// Current values, normalised
+	curFlag = false;
+	if(currentFlagText != null)
+	{
+		if(currentFlagText.trim().toLowerCase() == "true")
+		{
+			curFlag = true;
+		}
+	}
+	curReason = "";
+	if(currentReasonText != null)
+	{
+		curReason = currentReasonText;
+	}
+	statusText = "";
+	if(leadStatusText != null)
+	{
+		statusText = leadStatusText.trim();
+	}
+	// Effective date: must be a real yyyy-MM-dd date (round-trip check rejects rolled-over dates such as 2026-02-30)
+	effText = "";
+	if(effectiveDateText != null)
+	{
+		effText = effectiveDateText.trim();
+	}
+	if(effText.length() > 10)
+	{
+		effText = effText.subString(0,10);
+	}
+	effOk = false;
+	effDate = "1970-01-01".toDate();
+	if(effText.length() == 10)
+	{
+		try
+		{
+			effDate = effText.toDate();
+			if(effDate != null)
+			{
+				if(effDate.toString("yyyy-MM-dd") == effText)
+				{
+					effOk = true;
+				}
+			}
+		}
+		catch (eEff)
+		{
+			effOk = false;
+		}
+	}
+	if(effOk == false)
+	{
+		result.put("detail","EXCLUDED invalid effective date");
+		return result.toString();
+	}
+	// Registered date: empty or invalid -> EXCLUDED
+	regText = "";
+	if(registeredDateText != null)
+	{
+		regText = registeredDateText.trim();
+	}
+	if(regText == "")
+	{
+		result.put("detail","EXCLUDED no registered date");
+		return result.toString();
+	}
+	if(regText.length() > 10)
+	{
+		regText = regText.subString(0,10);
+	}
+	regOk = false;
+	regDate = "1970-01-01".toDate();
+	if(regText.length() == 10)
+	{
+		try
+		{
+			regDate = regText.toDate();
+			if(regDate != null)
+			{
+				if(regDate.toString("yyyy-MM-dd") == regText)
+				{
+					regOk = true;
+				}
+			}
+		}
+		catch (eReg)
+		{
+			regOk = false;
+		}
+	}
+	if(regOk == false)
+	{
+		result.put("detail","EXCLUDED invalid registered date");
+		return result.toString();
+	}
+	// Calendar day difference (both values are date-only)
+	diffMs = effDate.toLong() - regDate.toLong();
+	days = (diffMs / 86400000).floor();
+	daysLong = days.toLong();
+	daysText = daysLong.toString();
+	// Target state
+	targetFlag = false;
+	targetReason = "";
+	detailText = "";
+	if(terminalStatuses.contains(statusText))
+	{
+		detailText = "NOT STALE terminal status " + statusText;
+	}
+	else if(daysLong > staleThresholdDays)
+	{
+		targetFlag = true;
+		targetReason = "No business activity for " + daysText + " days since registration (" + regText + ")";
+		detailText = "STALE " + daysText + "d since " + regText;
+	}
+	else
+	{
+		detailText = "NOT STALE " + daysText + "d since " + regText;
+	}
+	changed = false;
+	if(curFlag != targetFlag)
+	{
+		changed = true;
+	}
+	if(curReason != targetReason)
+	{
+		changed = true;
+	}
+	result.put("change",changed);
+	if(changed == true)
+	{
+		writes = Map();
+		writes.put("BF_Stale_Flag",targetFlag);
+		writes.put("BF_Stale_Reason",targetReason);
+		result.put("writes",writes);
+		result.put("outcome","CHANGE");
+	}
+	else
+	{
+		result.put("outcome","NOCHANGE");
+	}
+	result.put("detail",detailText);
+	return result.toString();
+}

@@ -1,0 +1,432 @@
+string standalone.bf_seedPhase2()
+{
+// Backfill engine - Phase 2 fixture seeder (standalone) DRAFT v1, 2026-11-11 (TC-11)
+// Synthetic data only, created with trigger suppressed ("trigger": []), then read back by COQL.
+// (a) L2 boundary leads (Company BFTEST), BF_Registered_Date = JST run date minus N days:
+//     BFTEST-L2B-89   89 days, 未連絡  -> expected NOT stale
+//     BFTEST-L2B-90   90 days, 未連絡  -> expected NOT stale (exactly 90 is not over 90)
+//     BFTEST-L2B-91   91 days, 未連絡  -> expected STALE
+//     BFTEST-L2B-120  120 days, 未連絡 -> expected STALE
+//     BFTEST-L2B-120T 120 days, 失注   -> expected NOT stale (terminal status)
+// (b) Account BFTEST (found by COQL, created only if missing) and 6 Deals (Closing_Date = JST run date + N):
+//     BFTEST-D-PAST30 -30 / BFTEST-D-YEST -1 / BFTEST-D-TODAY 0 / BFTEST-D-TOMORROW +7 /
+//     BFTEST-D-PASTCLOSED -10 (Closed Won) / BFTEST-D-FUTURE +30; all others Stage = open constant.
+//     Expected D1: PAST30 overdue 30, YEST overdue 1, TODAY / TOMORROW / FUTURE / PASTCLOSED not overdue.
+// The expectations hold when the dry run Effective_Date equals the JST date this seeder ran.
+// Re-running is safe: a part whose fixtures already exist (by name prefix) is skipped, not duplicated.
+// PICKLIST VALUES CONFIRMED against the real values of the author's org on 2026-11-12:
+//   Deals Stage "Negotiation" and "Closed Won" exist as-is (unchanged).
+//   Leads Lead_Status is Japanese in this org: open = 未連絡, terminal = 失注 (was Not Contacted / Lost Lead).
+// A value outside the picklist can still be rejected (INVALID_DATA) or silently replaced by a default
+// (knowledge base 3.4), so the Leads and Deals are read back and every mismatch is reported.
+// DEALS PIPELINE IS MANDATORY in this org (measured 2026-11-12): the first run failed all 6 Deals with
+//   MANDATORY_NOT_FOUND because no Pipeline was sent. The create screen requires exactly Deal Name /
+//   Stage / Pipeline; Pipeline options are Standard / Lead Distribution / Service Orders, default Standard.
+//   Knowledge base 8: with Pipelines enabled, Pipeline must be sent together with Stage.
+// PIPELINE API VALUE CONFIRMED by probe bfPipeProbe (2026-11-12): sending "Standard" failed with
+//   MAPPING_MISMATCH because "Standard" matches no pipeline's actual_value. GET
+//   /settings/pipeline?layout_id=<layout id> (Standard layout) returned the Standard pipeline as
+//   id <pipeline id>, display_value = actual_value = "Standard (Standard)", default true
+//   (others: Lead Distribution <pipeline id>, Service Orders <pipeline id>).
+//   COQL returns Deals.Pipeline as the plain string "Standard (Standard)", so the read-back compares as-is.
+	stageOpen = "Negotiation";
+	stageClosed = "Closed Won";
+	// Deals Pipeline: mandatory; actual_value of the Standard pipeline (<pipeline id>), probed 2026-11-12 (see header)
+	dealPipeline = "Standard (Standard)";
+	leadStatusOpen = "未連絡";
+	leadStatusTerminal = "失注";
+	accountName = "BFTEST";
+	api = "https://www.zohoapis.jp/crm/v8";
+	// Corrected today (JST), same method as the Runner
+	rawNow = zoho.currenttime;
+	wallDate = rawNow.toDate();
+	wallYear = wallDate.toString("yyyy");
+	marBase = (wallYear + "-03-01").toDate();
+	dstStart = marBase;
+	novBase = (wallYear + "-11-01").toDate();
+	dstEnd = novBase;
+	probeSteps = {0,1,2,3,4,5,6};
+	for each ps in probeSteps
+	{
+		if(marBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstStart = marBase.addDay(ps).addDay(7);
+			break;
+		}
+	}
+	for each ps in probeSteps
+	{
+		if(novBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstEnd = novBase.addDay(ps);
+			break;
+		}
+	}
+	shiftHours = 17;
+	if(wallDate >= dstStart && wallDate < dstEnd)
+	{
+		shiftHours = 16;
+	}
+	today = rawNow.addHour(shiftHours).toDate();
+	todayText = today.toString("yyyy-MM-dd");
+	out = "SEED PHASE2 JST date " + todayText;
+	// ---------- (a) L2 boundary leads ----------
+	leadSuffixes = {"89","90","91","120","120T"};
+	leadDaysAgo = {"89","90","91","120","120"};
+	expectedLeads = Map();
+	leadRows = List();
+	li = 0;
+	for each sfx in leadSuffixes
+	{
+		daysAgo = leadDaysAgo.get(li).toLong();
+		regText = today.addDay(0 - daysAgo).toString("yyyy-MM-dd");
+		statusVal = leadStatusOpen;
+		if(sfx == "120T")
+		{
+			statusVal = leadStatusTerminal;
+		}
+		lname = "BFTEST-L2B-" + sfx;
+		lrow = Map();
+		lrow.put("Last_Name",lname);
+		lrow.put("Company","BFTEST");
+		lrow.put("BF_Registered_Date",regText);
+		lrow.put("Lead_Status",statusVal);
+		leadRows.add(lrow);
+		expectedLeads.put(lname,regText + "|" + statusVal);
+		li = li + 1;
+	}
+	lq = "select id, Last_Name from Leads where Last_Name like 'BFTEST-L2B-%' limit 200";
+	lqMap = Map();
+	lqMap.put("select_query",lq);
+	lqResp = invokeurl
+	[
+		url :api + "/coql"
+		type :POST
+		parameters:lqMap.toString()
+		connection:"crm_module"
+	];
+	leadsExisting = 0;
+	if(lqResp != null && lqResp.toString() != "")
+	{
+		if(lqResp.get("data") != null)
+		{
+			leadsExisting = lqResp.get("data").size();
+		}
+		else if(lqResp.get("code") != null)
+		{
+			return out + " ERROR: lead pre-check COQL failed: " + lqResp.get("code").toString();
+		}
+	}
+	if(leadsExisting > 0)
+	{
+		out = out + " | leads: skipped (" + leadsExisting.toString() + " BFTEST-L2B leads already exist)";
+	}
+	else
+	{
+		lBody = Map();
+		lBody.put("data",leadRows);
+		lBody.put("trigger",List());
+		lResp = invokeurl
+		[
+			url :api + "/Leads"
+			type :POST
+			parameters:lBody.toString()
+			connection:"crm_module"
+		];
+		lOk = 0;
+		lNg = 0;
+		lCodes = "";
+		if(lResp == null || lResp.get("data") == null)
+		{
+			lNg = leadRows.size();
+			lCodes = "no response data";
+		}
+		else
+		{
+			for each lr in lResp.get("data")
+			{
+				lc = ifnull(lr.get("code"),"").toString();
+				if(lc == "SUCCESS")
+				{
+					lOk = lOk + 1;
+				}
+				else
+				{
+					lNg = lNg + 1;
+					lCodes = lCodes + lc + " ";
+				}
+			}
+			lRespCount = lResp.get("data").size();
+			if(lRespCount < leadRows.size())
+			{
+				lMissingResp = leadRows.size() - lRespCount;
+				lNg = lNg + lMissingResp;
+				lCodes = lCodes + "missing-response ";
+			}
+		}
+		out = out + " | leads: ok=" + lOk.toString() + " ng=" + lNg.toString();
+		if(lCodes != "")
+		{
+			out = out + " codes=" + lCodes.trim();
+		}
+	}
+	// Read back the L2 fixtures (values as stored)
+	lvq = "select id, Last_Name, Lead_Status, BF_Registered_Date from Leads where Last_Name like 'BFTEST-L2B-%' limit 200";
+	lvMap = Map();
+	lvMap.put("select_query",lvq);
+	lvResp = invokeurl
+	[
+		url :api + "/coql"
+		type :POST
+		parameters:lvMap.toString()
+		connection:"crm_module"
+	];
+	lvFound = 0;
+	lvBad = "";
+	if(lvResp != null && lvResp.toString() != "")
+	{
+		if(lvResp.get("data") != null)
+		{
+			for each lv in lvResp.get("data")
+			{
+				lvFound = lvFound + 1;
+				lvName = ifnull(lv.get("Last_Name"),"").toString();
+				lvReg = "";
+				if(lv.get("BF_Registered_Date") != null)
+				{
+					lvReg = lv.get("BF_Registered_Date").toString();
+				}
+				lvStatus = ifnull(lv.get("Lead_Status"),"").toString();
+				lvExp = expectedLeads.get(lvName);
+				if(lvExp == null)
+				{
+					lvBad = lvBad + lvName + ":unexpected ";
+				}
+				else if(lvExp != lvReg + "|" + lvStatus)
+				{
+					lvBad = lvBad + lvName + ":" + lvReg + "|" + lvStatus + " ";
+				}
+			}
+		}
+	}
+	out = out + " | lead read-back found=" + lvFound.toString();
+	if(lvBad == "")
+	{
+		out = out + " values=OK";
+	}
+	else
+	{
+		out = out + " MISMATCH(expected date|status for this run date; older fixtures differ by design) " + lvBad.trim();
+	}
+	// ---------- (b) Account BFTEST ----------
+	accountId = "";
+	aq = "select id, Account_Name from Accounts where Account_Name = '" + accountName + "' limit 1";
+	aqMap = Map();
+	aqMap.put("select_query",aq);
+	aqResp = invokeurl
+	[
+		url :api + "/coql"
+		type :POST
+		parameters:aqMap.toString()
+		connection:"crm_module"
+	];
+	if(aqResp != null && aqResp.toString() != "")
+	{
+		if(aqResp.get("data") != null)
+		{
+			if(aqResp.get("data").size() > 0)
+			{
+				accountId = aqResp.get("data").get(0).get("id").toString();
+			}
+		}
+		else if(aqResp.get("code") != null)
+		{
+			return out + " | ERROR: account COQL failed: " + aqResp.get("code").toString();
+		}
+	}
+	if(accountId == "")
+	{
+		aRow = Map();
+		aRow.put("Account_Name",accountName);
+		aRows = List();
+		aRows.add(aRow);
+		aBody = Map();
+		aBody.put("data",aRows);
+		aBody.put("trigger",List());
+		aResp = invokeurl
+		[
+			url :api + "/Accounts"
+			type :POST
+			parameters:aBody.toString()
+			connection:"crm_module"
+		];
+		if(aResp == null || aResp.get("data") == null)
+		{
+			return out + " | ERROR: account creation returned no data";
+		}
+		aFirst = aResp.get("data").get(0);
+		if(ifnull(aFirst.get("code"),"").toString() != "SUCCESS")
+		{
+			return out + " | ERROR: account creation failed: " + ifnull(aFirst.get("code"),"").toString() + " " + ifnull(aFirst.get("message"),"").toString();
+		}
+		accountId = aFirst.get("details").get("id").toString();
+		out = out + " | account created id=" + accountId;
+	}
+	else
+	{
+		out = out + " | account found id=" + accountId;
+	}
+	// ---------- (c) Deals ----------
+	dealSuffixes = {"PAST30","YEST","TODAY","TOMORROW","PASTCLOSED","FUTURE"};
+	dealOffsets = {"-30","-1","0","7","-10","30"};
+	expectedDeals = Map();
+	dealRows = List();
+	di = 0;
+	for each dsx in dealSuffixes
+	{
+		offset = dealOffsets.get(di).toLong();
+		closeText = today.addDay(offset).toString("yyyy-MM-dd");
+		stageVal = stageOpen;
+		if(dsx == "PASTCLOSED")
+		{
+			stageVal = stageClosed;
+		}
+		dname = "BFTEST-D-" + dsx;
+		accRef = Map();
+		accRef.put("id",accountId);
+		drow = Map();
+		drow.put("Deal_Name",dname);
+		drow.put("Closing_Date",closeText);
+		drow.put("Stage",stageVal);
+		drow.put("Pipeline",dealPipeline);
+		drow.put("Account_Name",accRef);
+		dealRows.add(drow);
+		expectedDeals.put(dname,closeText + "|" + stageVal + "|" + dealPipeline);
+		di = di + 1;
+	}
+	dq = "select id, Deal_Name from Deals where Deal_Name like 'BFTEST-D-%' limit 200";
+	dqMap = Map();
+	dqMap.put("select_query",dq);
+	dqResp = invokeurl
+	[
+		url :api + "/coql"
+		type :POST
+		parameters:dqMap.toString()
+		connection:"crm_module"
+	];
+	dealsExisting = 0;
+	if(dqResp != null && dqResp.toString() != "")
+	{
+		if(dqResp.get("data") != null)
+		{
+			dealsExisting = dqResp.get("data").size();
+		}
+		else if(dqResp.get("code") != null)
+		{
+			return out + " | ERROR: deal pre-check COQL failed: " + dqResp.get("code").toString();
+		}
+	}
+	if(dealsExisting > 0)
+	{
+		out = out + " | deals: skipped (" + dealsExisting.toString() + " BFTEST-D deals already exist)";
+	}
+	else
+	{
+		dBody = Map();
+		dBody.put("data",dealRows);
+		dBody.put("trigger",List());
+		dResp = invokeurl
+		[
+			url :api + "/Deals"
+			type :POST
+			parameters:dBody.toString()
+			connection:"crm_module"
+		];
+		dOk = 0;
+		dNg = 0;
+		dCodes = "";
+		if(dResp == null || dResp.get("data") == null)
+		{
+			dNg = dealRows.size();
+			dCodes = "no response data";
+		}
+		else
+		{
+			for each dr in dResp.get("data")
+			{
+				dc = ifnull(dr.get("code"),"").toString();
+				if(dc == "SUCCESS")
+				{
+					dOk = dOk + 1;
+				}
+				else
+				{
+					dNg = dNg + 1;
+					dCodes = dCodes + dc + " ";
+				}
+			}
+			dRespCount = dResp.get("data").size();
+			if(dRespCount < dealRows.size())
+			{
+				dMissingResp = dealRows.size() - dRespCount;
+				dNg = dNg + dMissingResp;
+				dCodes = dCodes + "missing-response ";
+			}
+		}
+		out = out + " | deals: ok=" + dOk.toString() + " ng=" + dNg.toString();
+		if(dCodes != "")
+		{
+			out = out + " codes=" + dCodes.trim();
+		}
+	}
+	// Read back the Deals: catches a Stage or Pipeline silently replaced by a default value
+	dvq = "select id, Deal_Name, Stage, Pipeline, Closing_Date from Deals where Deal_Name like 'BFTEST-D-%' limit 200";
+	dvMap = Map();
+	dvMap.put("select_query",dvq);
+	dvResp = invokeurl
+	[
+		url :api + "/coql"
+		type :POST
+		parameters:dvMap.toString()
+		connection:"crm_module"
+	];
+	dvFound = 0;
+	dvBad = "";
+	if(dvResp != null && dvResp.toString() != "")
+	{
+		if(dvResp.get("data") != null)
+		{
+			for each dv in dvResp.get("data")
+			{
+				dvFound = dvFound + 1;
+				dvName = ifnull(dv.get("Deal_Name"),"").toString();
+				dvClose = "";
+				if(dv.get("Closing_Date") != null)
+				{
+					dvClose = dv.get("Closing_Date").toString();
+				}
+				dvStage = ifnull(dv.get("Stage"),"").toString();
+				dvPipeline = ifnull(dv.get("Pipeline"),"").toString();
+				dvExp = expectedDeals.get(dvName);
+				if(dvExp == null)
+				{
+					dvBad = dvBad + dvName + ":unexpected ";
+				}
+				else if(dvExp != dvClose + "|" + dvStage + "|" + dvPipeline)
+				{
+					dvBad = dvBad + dvName + ":" + dvClose + "|" + dvStage + "|" + dvPipeline + " ";
+				}
+			}
+		}
+	}
+	out = out + " | deal read-back found=" + dvFound.toString();
+	if(dvBad == "")
+	{
+		out = out + " values=OK";
+	}
+	else
+	{
+		out = out + " MISMATCH(expected date|stage|pipeline for this run date) " + dvBad.trim();
+	}
+	return out;
+}

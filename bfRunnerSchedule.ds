@@ -1,0 +1,115 @@
+string standalone.bf_runnerSchedule()
+{
+// Backfill engine - schedule wrapper (DRAFT v2, 2026-11-12, Phase 2)
+// Picks at most 2 runnable Runs (Status Queued or Paused_Budget, oldest Created_Time first) and calls
+// standalone.bf_runnerCore once for each, one after the other (no parallel runs; COQL sub-concurrency).
+// The Runner itself refuses locked runs (TC-13), mismatched versions (TC-12) and other statuses.
+// Declaration history (measured in this org on 2026-11-12):
+//   - v1 was declared as void standalone.bf_runnerSchedule(). Saving it failed with:
+//       Invalid return Type void. Category standalone returns string (Line :1)
+//   - Together with the earlier Map refusal (Invalid return Type Map. Category standalone returns string),
+//     this confirms that a standalone function can only return string (knowledge base 5.2).
+//   - v2 is declared as string standalone.bf_runnerSchedule() and returns a one-line run summary, e.g.
+//       SCHEDULE done attempted=2 [run <id> -> <first 120 chars of result>] [run <id> -> ...]
+//     Zoho may drop underscores from displayed return strings (knowledge base 5.2); the fixed words of the summary avoid them.
+//   - The processing itself is unchanged from v1. The info lines are kept as they were.
+//   - The real schedule assignment needs the schedule category (void schedule.<name>), which is created
+//     separately from the Schedules screen, e.g. void schedule.bf_runnerschedule() with the same body minus
+//     the return statements (or a thin body that calls this function). This file stays the standalone
+//     version for manual runs and testing.
+// COQL on the custom modules Backfill_Runs / Backfill_Logs (measured in this org on 2026-11-12):
+//   - COQL works on both custom modules via connection crm_module.
+//   - Rows found = HTTP 200 with data. No rows = HTTP 204 with an empty body, which means there is nothing to run.
+//   - If the query fails (error code such as INVALID_QUERY / INVALID_MODULE, an exception, or an
+//     unexpected body), this wrapper only writes the reason with info and ends normally. It never guesses
+//     a Run id and never falls back to Search (Search has an index delay; knowledge base 2.1).
+// Result text in the summary is cut to the first 120 characters (subString errors past the end, so the
+// length is checked first; knowledge base 6.2).
+	api = "https://www.zohoapis.jp/crm/v8";
+	q = "select id, Name, Status, Created_Time from Backfill_Runs where Status in ('Queued','Paused_Budget') order by Created_Time asc limit 2";
+	qMap = Map();
+	qMap.put("select_query",q);
+	resp = Map();
+	coqlOk = true;
+	failReason = "";
+	try
+	{
+		resp = invokeurl
+		[
+			url :api + "/coql"
+			type :POST
+			parameters:qMap.toString()
+			connection:"crm_module"
+		];
+	}
+	catch (eQ)
+	{
+		coqlOk = false;
+		failReason = "COQL call raised an exception: " + eQ.toString();
+	}
+	runIds = List();
+	if(coqlOk)
+	{
+		if(resp == null || resp.toString() == "")
+		{
+			info "bf_runnerSchedule: no runnable run (empty COQL response)";
+		}
+		else if(resp.get("data") == null)
+		{
+			if(resp.get("code") != null)
+			{
+				coqlOk = false;
+				failReason = "COQL on Backfill_Runs failed: " + resp.get("code").toString() + " " + ifnull(resp.get("message"),"").toString();
+			}
+			else
+			{
+				info "bf_runnerSchedule: no runnable run";
+			}
+		}
+		else
+		{
+			for each r in resp.get("data")
+			{
+				if(r.get("id") != null)
+				{
+					runIds.add(r.get("id").toString());
+				}
+			}
+		}
+	}
+	summaryParts = "";
+	if(coqlOk == false)
+	{
+		info "bf_runnerSchedule: ended without running anything. " + failReason;
+		failHead = failReason;
+		if(failHead.length() > 120)
+		{
+			failHead = failHead.subString(0,120);
+		}
+		summaryParts = " [not run: " + failHead + "]";
+	}
+	for each rid in runIds
+	{
+		resultHead = "";
+		try
+		{
+			result = standalone.bf_runnerCore(rid);
+			info "bf_runnerSchedule: run " + rid + " -> " + result;
+			resultHead = ifnull(result,"").toString();
+		}
+		catch (eR)
+		{
+			info "bf_runnerSchedule: run " + rid + " raised an exception: " + eR.toString();
+			resultHead = "EXCEPTION " + eR.toString();
+		}
+		if(resultHead.length() > 120)
+		{
+			resultHead = resultHead.subString(0,120);
+		}
+		summaryParts = summaryParts + " [run " + rid + " -> " + resultHead + "]";
+	}
+	attempted = runIds.size().toString();
+	info "bf_runnerSchedule: done, runs attempted=" + attempted;
+	summary = "SCHEDULE done attempted=" + attempted + summaryParts;
+	return summary;
+}

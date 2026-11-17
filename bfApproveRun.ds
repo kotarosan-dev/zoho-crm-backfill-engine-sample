@@ -1,0 +1,200 @@
+string standalone.bf_approveRun(String runIdText)
+{
+// Backfill engine - approve a dry-run Run (standalone) DRAFT v1, 2026-11-11 (Phase 2)
+// Approves only when Status is DryRunDone. Before approving it re-checks:
+//   lock         Lock_Token is empty
+//   version      code version constant for the rule == Run.Rule_Version
+//   fingerprint  not empty and equal to the Runner formula
+//                Rule_ID + "|" + Rule_Version + "|" + Boundary_Max_ID + "|" + Effective_Date (yyyy-MM-dd)
+//   freshness    DryRun_At within 7 days (spec 13.3: approval expires 7 days after the dry run), whole JST days
+// Any mismatch = refused, nothing written.
+// On success: Approved_At = now as a JST ISO string with "+09:00" (same clock correction as the Runner),
+// then Status = Queued. Grouped writes (Approved_At first, Status last) and a read-back check.
+// Approved_By is NOT touched: this function does not set it (a button / standalone call cannot reliably
+// record the approving user here). Record the approver in the UI if required.
+// Rule version constants: keep identical in bfRunnerCore, bfValidateRun and bfApproveRun.
+	verL1 = "L1-v1";
+	verL2 = "L2-v1";
+	verD1 = "D1-v1";
+	freshDays = 7;
+	runId = runIdText.toLong();
+	run = zoho.crm.getRecordById("Backfill_Runs",runId);
+	if(run == null)
+	{
+		return "ERROR: run not found";
+	}
+	status = ifnull(run.get("Status"),"").toString();
+	if(status != "DryRunDone")
+	{
+		return "REFUSED: status is " + status + "; only a DryRunDone run can be approved";
+	}
+	// Corrected now (JST), same method as the Runner
+	rawNow = zoho.currenttime;
+	wallDate = rawNow.toDate();
+	wallYear = wallDate.toString("yyyy");
+	marBase = (wallYear + "-03-01").toDate();
+	dstStart = marBase;
+	novBase = (wallYear + "-11-01").toDate();
+	dstEnd = novBase;
+	probeSteps = {0,1,2,3,4,5,6};
+	for each ps in probeSteps
+	{
+		if(marBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstStart = marBase.addDay(ps).addDay(7);
+			break;
+		}
+	}
+	for each ps in probeSteps
+	{
+		if(novBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstEnd = novBase.addDay(ps);
+			break;
+		}
+	}
+	shiftHours = 17;
+	if(wallDate >= dstStart && wallDate < dstEnd)
+	{
+		shiftHours = 16;
+	}
+	todayText = rawNow.addHour(shiftHours).toDate().toString("yyyy-MM-dd");
+	nowIsoJst = rawNow.addHour(shiftHours).toString("yyyy-MM-dd'T'HH:mm:ss") + "+09:00";
+	reasons = "";
+	// Lock
+	lockVal = ifnull(run.get("Lock_Token"),"").toString();
+	if(lockVal != "")
+	{
+		reasons = reasons + " [lock held: " + lockVal + "]";
+	}
+	// Version
+	ruleId = ifnull(run.get("Rule_ID"),"").toString();
+	codeVersion = "";
+	if(ruleId == "L1")
+	{
+		codeVersion = verL1;
+	}
+	else if(ruleId == "L2")
+	{
+		codeVersion = verL2;
+	}
+	else if(ruleId == "D1")
+	{
+		codeVersion = verD1;
+	}
+	runVersion = ifnull(run.get("Rule_Version"),"").toString();
+	if(codeVersion == "")
+	{
+		reasons = reasons + " [unknown rule " + ruleId + "]";
+	}
+	else if(runVersion != codeVersion)
+	{
+		reasons = reasons + " [version mismatch: code " + codeVersion + " vs run " + runVersion + "]";
+	}
+	// Fingerprint (Runner formula)
+	boundary = "";
+	if(run.get("Boundary_Max_ID") != null)
+	{
+		boundary = run.get("Boundary_Max_ID").toString();
+	}
+	effectiveText = "";
+	if(run.get("Effective_Date") != null)
+	{
+		try
+		{
+			effectiveText = run.get("Effective_Date").toString().toDate().toString("yyyy-MM-dd");
+		}
+		catch (e1)
+		{
+			effectiveText = run.get("Effective_Date").toString().subString(0,10);
+		}
+	}
+	storedFp = ifnull(run.get("Config_Fingerprint"),"").toString();
+	expectedFp = ruleId + "|" + runVersion + "|" + boundary + "|" + effectiveText;
+	if(storedFp == "")
+	{
+		reasons = reasons + " [fingerprint empty]";
+	}
+	else if(storedFp != expectedFp)
+	{
+		reasons = reasons + " [fingerprint mismatch: stored " + storedFp + " vs recomputed " + expectedFp + "]";
+	}
+	// Freshness (whole JST days)
+	dryAtText = "";
+	if(run.get("DryRun_At") != null)
+	{
+		dryAtText = run.get("DryRun_At").toString();
+	}
+	if(dryAtText.length() < 10)
+	{
+		reasons = reasons + " [no DryRun At]";
+	}
+	else
+	{
+		ageOk = false;
+		ageText = "?";
+		try
+		{
+			dryDate = dryAtText.subString(0,10).toDate();
+			todayDate = todayText.toDate();
+			ageDays = ((todayDate.toLong() - dryDate.toLong()) / 86400000).floor();
+			ageText = ageDays.toLong().toString();
+			if(ageDays >= 0 && ageDays <= freshDays)
+			{
+				ageOk = true;
+			}
+		}
+		catch (e2)
+		{
+			ageOk = false;
+		}
+		if(ageOk == false)
+		{
+			reasons = reasons + " [dry run too old or unreadable: " + dryAtText + ", age " + ageText + " days, limit 7]";
+		}
+	}
+	if(reasons != "")
+	{
+		return "REFUSED: nothing written;" + reasons;
+	}
+	// Approve: Approved_At first, Status last (grouped writes, then read back)
+	a1 = Map();
+	a1.put("Approved_At",nowIsoJst);
+	zoho.crm.updateRecord("Backfill_Runs",runId,a1);
+	a2 = Map();
+	a2.put("Status","Queued");
+	zoho.crm.updateRecord("Backfill_Runs",runId,a2);
+	chk = zoho.crm.getRecordById("Backfill_Runs",runId);
+	statusOk = false;
+	approvedOk = false;
+	approvedBack = "";
+	if(chk != null)
+	{
+		if(ifnull(chk.get("Status"),"").toString() == "Queued")
+		{
+			statusOk = true;
+		}
+		if(chk.get("Approved_At") != null)
+		{
+			approvedBack = chk.get("Approved_At").toString();
+			if(approvedBack.length() >= 16)
+			{
+				if(approvedBack.subString(0,16) == nowIsoJst.subString(0,16))
+				{
+					approvedOk = true;
+				}
+			}
+		}
+	}
+	persistOk = false;
+	if(statusOk && approvedOk)
+	{
+		persistOk = true;
+	}
+	head = "APPROVED";
+	if(persistOk == false)
+	{
+		head = "CHECK: approval writes not confirmed by read-back for";
+	}
+	return head + " run " + runIdText + " status=Queued approvedAt=" + nowIsoJst + " readBack=" + approvedBack + " persistVerified=" + persistOk.toString();
+}

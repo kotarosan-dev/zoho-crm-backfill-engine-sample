@@ -1,0 +1,183 @@
+string standalone.bf_seedMoreLeads()
+{
+// Backfill engine - scale fixture seeder (standalone) DRAFT v1, 2026-11-11 (Phase 2, TC-10 scale)
+// Creates 2,000 synthetic leads in 20 POSTs of 100 (the v8 write limit), trigger suppressed ("trigger": []).
+//   Last_Name = BFTEST2-0001 .. BFTEST2-2000, Company = BFTEST2
+//   BF_Registered_Date = JST run date minus ((n * 53) % 400) days
+//   Lead_Status = "失注" (terminal) when n is a multiple of 10, otherwise "未連絡"
+//   (Japanese Lead_Status values confirmed against the real values of the author's org on 2026-11-12;
+//   were Not Contacted / Lost Lead)
+// Every element of every response data[] is checked (partial failure = HTTP 207 or 200 with non-SUCCESS codes,
+// knowledge base 3.1). A batch whose response has no data stops the seeder (no blind retries).
+// Refuses to run when any BFTEST2 lead already exists, so it never creates duplicates; delete the BFTEST2
+// leads first if a re-seed is needed.
+// Expected (oracle, BFTEST2 only, evaluated on the seeding date): L1 buckets 0-30=155 / 31-90=300 /
+// 91-365=1375 / Over365=170; L2 stale=1395 (terminal 200, of which 150 are older than 90 days; 5 leads are
+// exactly 90 days old and are not stale).
+	api = "https://www.zohoapis.jp/crm/v8";
+	statusOpen = "未連絡";
+	statusTerminal = "失注";
+	// Corrected today (JST), same method as the Runner
+	rawNow = zoho.currenttime;
+	wallDate = rawNow.toDate();
+	wallYear = wallDate.toString("yyyy");
+	marBase = (wallYear + "-03-01").toDate();
+	dstStart = marBase;
+	novBase = (wallYear + "-11-01").toDate();
+	dstEnd = novBase;
+	probeSteps = {0,1,2,3,4,5,6};
+	for each ps in probeSteps
+	{
+		if(marBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstStart = marBase.addDay(ps).addDay(7);
+			break;
+		}
+	}
+	for each ps in probeSteps
+	{
+		if(novBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstEnd = novBase.addDay(ps);
+			break;
+		}
+	}
+	shiftHours = 17;
+	if(wallDate >= dstStart && wallDate < dstEnd)
+	{
+		shiftHours = 16;
+	}
+	today = rawNow.addHour(shiftHours).toDate();
+	todayText = today.toString("yyyy-MM-dd");
+	// Duplicate guard
+	pq = "select id from Leads where Company = 'BFTEST2' limit 1";
+	pqMap = Map();
+	pqMap.put("select_query",pq);
+	pqResp = invokeurl
+	[
+		url :api + "/coql"
+		type :POST
+		parameters:pqMap.toString()
+		connection:"crm_module"
+	];
+	if(pqResp != null && pqResp.toString() != "")
+	{
+		if(pqResp.get("data") != null)
+		{
+			if(pqResp.get("data").size() > 0)
+			{
+				return "NOT SEEDED: BFTEST2 leads already exist; delete them first to re-seed";
+			}
+		}
+		else if(pqResp.get("code") != null)
+		{
+			return "ERROR: pre-check COQL failed: " + pqResp.get("code").toString();
+		}
+	}
+	batchSteps = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19};
+	steps = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99};
+	okCount = 0;
+	ngCount = 0;
+	batchesDone = 0;
+	stopped = false;
+	stopReason = "";
+	ngCodes = "";
+	ngCodeCount = 0;
+	firstId = "";
+	lastId = "";
+	for each b in batchSteps
+	{
+		if(stopped)
+		{
+			break;
+		}
+		rows = List();
+		for each i in steps
+		{
+			n = b * 100 + i + 1;
+			daysAgo = (n * 53) % 400;
+			nameNum = n.toString();
+			if(n < 10)
+			{
+				nameNum = "000" + nameNum;
+			}
+			else if(n < 100)
+			{
+				nameNum = "00" + nameNum;
+			}
+			else if(n < 1000)
+			{
+				nameNum = "0" + nameNum;
+			}
+			statusVal = statusOpen;
+			if(n % 10 == 0)
+			{
+				statusVal = statusTerminal;
+			}
+			row = Map();
+			row.put("Last_Name","BFTEST2-" + nameNum);
+			row.put("Company","BFTEST2");
+			row.put("BF_Registered_Date",today.addDay(0 - daysAgo).toString("yyyy-MM-dd"));
+			row.put("Lead_Status",statusVal);
+			rows.add(row);
+		}
+		body = Map();
+		body.put("data",rows);
+		body.put("trigger",List());
+		resp = invokeurl
+		[
+			url :api + "/Leads"
+			type :POST
+			parameters:body.toString()
+			connection:"crm_module"
+		];
+		if(resp == null || resp.get("data") == null)
+		{
+			stopped = true;
+			batchNo = b + 1;
+			stopReason = "batch " + batchNo.toString() + " returned no data";
+			ngCount = ngCount + rows.size();
+			break;
+		}
+		respRows = resp.get("data");
+		for each r in respRows
+		{
+			code = ifnull(r.get("code"),"").toString();
+			if(code == "SUCCESS")
+			{
+				okCount = okCount + 1;
+				rid = r.get("details").get("id").toString();
+				if(firstId == "")
+				{
+					firstId = rid;
+				}
+				lastId = rid;
+			}
+			else
+			{
+				ngCount = ngCount + 1;
+				if(ngCodeCount < 5)
+				{
+					ngCodes = ngCodes + code + " ";
+					ngCodeCount = ngCodeCount + 1;
+				}
+			}
+		}
+		if(respRows.size() < rows.size())
+		{
+			shortBy = rows.size() - respRows.size();
+			ngCount = ngCount + shortBy;
+		}
+		batchesDone = batchesDone + 1;
+	}
+	out = "SEEDED BFTEST2 JST date " + todayText + " ok=" + okCount.toString() + " ng=" + ngCount.toString() + " batches=" + batchesDone.toString() + "/20 firstId=" + firstId + " lastId=" + lastId;
+	if(ngCodes != "")
+	{
+		out = out + " firstCodes=" + ngCodes.trim();
+	}
+	if(stopped)
+	{
+		out = out + " STOPPED: " + stopReason;
+	}
+	return out;
+}

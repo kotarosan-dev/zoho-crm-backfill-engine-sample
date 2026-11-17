@@ -1,0 +1,1262 @@
+string standalone.bf_runnerCore(String runIdText)
+{
+// Backfill engine - runner core (standalone) DRAFT v2.0, 2026-11-11 (Phase 2)
+// v2.0 (Phase 2): rules L2 (Leads) and D1 (Deals) added. The L1 path keeps the measured v1.3 behaviour
+// (inline evaluation, id-cursor paging, ledger, batch split, grouped persist, read-back verification).
+//   - Rule_ID branch: L1 = inline evaluation (unchanged from v1.3),
+//     L2 = standalone.bf_evaluateL2, D1 = standalone.bf_evaluateD1.
+//     Both evaluators return the String form of their result Map (standalone returns String only,
+//     measured 2026-11-12); the runner applies .toMap() to the text before reading the keys.
+//     Page and recheck COQL field lists and the PUT module switch per rule.
+//     Stale guard is common to all rules: Modified_Time at page read vs Modified_Time at recheck (v1.3).
+//   - Module = Run.Target_Module (L1/L2 = Leads, D1 = Deals). Empty = derived from the rule; a mismatch is refused.
+//   - Execute start version check (TC-12): code version constant vs Run.Rule_Version.
+//     Mismatch = no write to the target module, reason appended to Error_Summary (grouped persist),
+//     Status -> Paused_Failure (so the schedule wrapper does not retry it every hour),
+//     return "REFUSED version mismatch ...". A fingerprint mismatch is handled the same way.
+//   - Lock detection (TC-13): a non-empty Lock_Token at start = detection time (JST ISO) appended
+//     to Error_Summary, return "SKIP: locked ...". Nothing else is written.
+//   - Pending_IDs mode (Retry Run, TC-18): when Pending_IDs is not empty there is no COQL paging and
+//     no cursor. Only those ids (max 1,000, chunks of 100) are evaluated and written. Ledger Phase = Retry.
+//     Ids that no longer exist are recorded as MISSING in a ledger Batch row.
+//   - Manual stop / cancel (TC-04, spec 13.1): the Run Status is re-read before every page after the first
+//     and before the final persist. Cancelled or terminal = nothing more is persisted.
+//     Paused_Manual = cursor and counters are persisted, the operator's Status is left as is.
+// History:
+// v1.3: batch slice counter starts at 0; Paused_Budget is a resumable Execute status; Batch_No unique per invocation.
+// v1.2: final persist grouped + DryRun_At as ISO string + read-back verification
+// (v1.1's single 11-field persist silently dropped; see persist section comment).
+// v1.1 (measured 2026-11-10): custom modules are addressed by their real API names Backfill_Runs / Backfill_Logs.
+// Log primary field key is Name (not Log_Name). Page condition is rebuilt per page.
+// Spec v0.2 sections 3, 6, 7, 13. Previous version preserved as bfRunnerCore-v1.3.ds.
+// Called with a Backfill Runs record id. Behaviour depends on the Run Status:
+//   DryRunning              -> dry run phase (no writes to the target module)
+//   Queued / Paused_Budget  -> execute phase (writes BF fields, trigger suppressed)
+// One invocation processes at most 2 COQL pages of 200 records (cursor mode) or the whole Pending_IDs set.
+// Connection name must be a literal in invokeurl (measured in this org).
+// Rule version constants: keep identical in bfRunnerCore, bfValidateRun and bfApproveRun.
+	verL1 = "L1-v1";
+	verL2 = "L2-v1";
+	verD1 = "D1-v1";
+	pendingMax = 1000;
+	api = "https://www.zohoapis.jp/crm/v8";
+	runId = runIdText.toLong();
+	run = zoho.crm.getRecordById("Backfill_Runs",runId);
+	if(run == null)
+	{
+		return "ERROR: run not found";
+	}
+	status = ifnull(run.get("Status"),"");
+	if(status != "DryRunning" && status != "Queued" && status != "Paused_Budget")
+	{
+		return "SKIP: status is " + status;
+	}
+	phase = "DryRun";
+	if(status == "Queued" || status == "Paused_Budget")
+	{
+		phase = "Execute";
+	}
+	// Corrected today (JST). zoho.currenttime in this org lags JST:
+	// +17h, or +16h while US daylight saving applies (measured 2026-11-09/10).
+	// v2.0: computed before the lock check so that the lock detection can be time-stamped (no writes here).
+	rawNow = zoho.currenttime;
+	wallDate = rawNow.toDate();
+	wallYear = wallDate.toString("yyyy");
+	marBase = (wallYear + "-03-01").toDate();
+	dstStart = marBase;
+	novBase = (wallYear + "-11-01").toDate();
+	dstEnd = novBase;
+	probeSteps = {0,1,2,3,4,5,6};
+	for each ps in probeSteps
+	{
+		if(marBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstStart = marBase.addDay(ps).addDay(7);
+			break;
+		}
+	}
+	for each ps in probeSteps
+	{
+		if(novBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstEnd = novBase.addDay(ps);
+			break;
+		}
+	}
+	shiftHours = 17;
+	if(wallDate >= dstStart && wallDate < dstEnd)
+	{
+		shiftHours = 16;
+	}
+	todayText = rawNow.addHour(shiftHours).toDate().toString("yyyy-MM-dd");
+	nowIsoJst = rawNow.addHour(shiftHours).toString("yyyy-MM-dd'T'HH:mm:ss") + "+09:00";
+	// Lock detection (TC-13). Detection evidence = one line appended to Error_Summary.
+	lockVal = ifnull(run.get("Lock_Token"),"");
+	if(lockVal != "")
+	{
+		lockLine = "LOCK DETECTED at " + nowIsoJst + " (status " + status + ", token " + lockVal + "): invocation skipped, no record written";
+		oldSum = ifnull(run.get("Error_Summary"),"").toString();
+		newSum = lockLine;
+		if(oldSum != "")
+		{
+			newSum = oldSum + "\n" + lockLine;
+		}
+		// Error_Summary is multi-line (small, 2,000 chars): keep the newest 1,900 chars
+		if(newSum.length() > 1900)
+		{
+			cutFrom = newSum.length() - 1900;
+			newSum = newSum.subString(cutFrom,newSum.length());
+		}
+		lkMap = Map();
+		lkMap.put("Error_Summary",newSum);
+		zoho.crm.updateRecord("Backfill_Runs",runId,lkMap);
+		lkVerify = zoho.crm.getRecordById("Backfill_Runs",runId);
+		lkOk = false;
+		if(lkVerify != null)
+		{
+			lkSum = ifnull(lkVerify.get("Error_Summary"),"").toString();
+			if(lkSum.contains(lockLine))
+			{
+				lkOk = true;
+			}
+		}
+		return "SKIP: locked token=" + lockVal + " detectedAt=" + nowIsoJst + " persistVerified=" + lkOk.toString();
+	}
+	// Rule, code version and target module
+	ruleId = ifnull(run.get("Rule_ID"),"");
+	codeVersion = "";
+	expectedModule = "";
+	if(ruleId == "L1")
+	{
+		codeVersion = verL1;
+		expectedModule = "Leads";
+	}
+	else if(ruleId == "L2")
+	{
+		codeVersion = verL2;
+		expectedModule = "Leads";
+	}
+	else if(ruleId == "D1")
+	{
+		codeVersion = verD1;
+		expectedModule = "Deals";
+	}
+	if(codeVersion == "")
+	{
+		return "ERROR: unknown rule " + ruleId;
+	}
+	moduleName = ifnull(run.get("Target_Module"),"").toString();
+	if(moduleName == "")
+	{
+		moduleName = expectedModule;
+	}
+	if(moduleName != expectedModule)
+	{
+		return "ERROR: target module mismatch rule=" + ruleId + " module=" + moduleName + " expected=" + expectedModule;
+	}
+	// Pending_IDs mode (Retry Run). Comma separated record ids, digits only, max 1,000, duplicates removed.
+	pendingText = ifnull(run.get("Pending_IDs"),"").toString().trim();
+	pendingMode = false;
+	pendingList = List();
+	if(pendingText != "")
+	{
+		pendingMode = true;
+		seenIds = Map();
+		badCount = 0;
+		for each rawP in pendingText.toList(",")
+		{
+			pt = rawP.trim();
+			if(pt != "")
+			{
+				okNum = false;
+				try
+				{
+					pn = pt.toLong();
+					if(pn > 0 && pn.toString() == pt)
+					{
+						okNum = true;
+					}
+				}
+				catch (eP)
+				{
+					okNum = false;
+				}
+				if(okNum == false)
+				{
+					badCount = badCount + 1;
+				}
+				else if(seenIds.get(pt) == null)
+				{
+					seenIds.put(pt,true);
+					pendingList.add(pt);
+				}
+			}
+		}
+		if(badCount > 0)
+		{
+			return "ERROR: Pending IDs contains " + badCount.toString() + " non-numeric entries; nothing written";
+		}
+		if(pendingList.size() == 0)
+		{
+			return "ERROR: Pending IDs is not empty but holds no id; nothing written";
+		}
+		if(pendingList.size() > pendingMax)
+		{
+			return "ERROR: Pending IDs holds " + pendingList.size().toString() + " ids, above the limit of 1000; nothing written";
+		}
+	}
+	// Run fields
+	effectiveText = "";
+	if(run.get("Effective_Date") != null)
+	{
+		try
+		{
+			effectiveText = run.get("Effective_Date").toString().toDate().toString("yyyy-MM-dd");
+		}
+		catch (e1)
+		{
+			effectiveText = run.get("Effective_Date").toString().subString(0,10);
+		}
+	}
+	cursor = "0";
+	boundary = "";
+	if(phase == "DryRun")
+	{
+		if(run.get("DryRun_Cursor") != null && run.get("DryRun_Cursor") != "")
+		{
+			cursor = run.get("DryRun_Cursor").toString();
+		}
+		if(run.get("Boundary_Max_ID") != null)
+		{
+			boundary = run.get("Boundary_Max_ID").toString();
+		}
+		if(effectiveText == "")
+		{
+			effectiveText = todayText;
+		}
+	}
+	else
+	{
+		if(run.get("Exec_Cursor") != null && run.get("Exec_Cursor") != "")
+		{
+			cursor = run.get("Exec_Cursor").toString();
+		}
+		if(run.get("Boundary_Max_ID") != null)
+		{
+			boundary = run.get("Boundary_Max_ID").toString();
+		}
+		// Version check first (TC-12): the code must still implement the version frozen on the run.
+		runVersion = ifnull(run.get("Rule_Version"),"").toString();
+		refuseLine = "";
+		refuseReturn = "";
+		if(runVersion != codeVersion)
+		{
+			refuseLine = "REFUSED version mismatch at " + nowIsoJst + ": code " + codeVersion + " vs run " + runVersion + "; no record written";
+			refuseReturn = "REFUSED version mismatch code=" + codeVersion + " run=" + runVersion + " writes=0";
+		}
+		if(refuseLine == "" && effectiveText == "")
+		{
+			return "ERROR: effective date is not frozen on this run";
+		}
+		// Fingerprint check: rule, version, boundary and effective date must match the dry run record (v1.3 formula).
+		if(refuseLine == "")
+		{
+			fp = ifnull(run.get("Config_Fingerprint"),"");
+			expectedFp = ruleId + "|" + runVersion + "|" + boundary + "|" + effectiveText;
+			if(fp != "" && fp != expectedFp)
+			{
+				refuseLine = "REFUSED config fingerprint mismatch at " + nowIsoJst + ": run " + fp + " vs expected " + expectedFp + "; no record written";
+				refuseReturn = "ERROR: config fingerprint mismatch writes=0";
+			}
+		}
+		if(refuseLine != "")
+		{
+			oldSum2 = ifnull(run.get("Error_Summary"),"").toString();
+			newSum2 = refuseLine;
+			if(oldSum2 != "")
+			{
+				newSum2 = oldSum2 + "\n" + refuseLine;
+			}
+			if(newSum2.length() > 1900)
+			{
+				cutFrom2 = newSum2.length() - 1900;
+				newSum2 = newSum2.subString(cutFrom2,newSum2.length());
+			}
+			rf1 = Map();
+			rf1.put("Error_Summary",newSum2);
+			zoho.crm.updateRecord("Backfill_Runs",runId,rf1);
+			rf2 = Map();
+			rf2.put("Status","Paused_Failure");
+			zoho.crm.updateRecord("Backfill_Runs",runId,rf2);
+			rfVerify = zoho.crm.getRecordById("Backfill_Runs",runId);
+			rfOk = false;
+			if(rfVerify != null)
+			{
+				rfSum = ifnull(rfVerify.get("Error_Summary"),"").toString();
+				if(rfSum.contains(refuseLine) && ifnull(rfVerify.get("Status"),"") == "Paused_Failure")
+				{
+					rfOk = true;
+				}
+			}
+			return refuseReturn + " persistVerified=" + rfOk.toString();
+		}
+	}
+	// Optional created range parameters (raw fragments, combined pairwise below)
+	fromCond = "";
+	if(run.get("Param_Created_From") != null)
+	{
+		fromText = "";
+		try
+		{
+			fromText = run.get("Param_Created_From").toString().toDate().toString("yyyy-MM-dd");
+		}
+		catch (e2)
+		{
+			fromText = run.get("Param_Created_From").toString().subString(0,10);
+		}
+		fromCond = "Created_Time >= '" + fromText + "T00:00:00+09:00'";
+	}
+	toCond = "";
+	if(run.get("Param_Created_To") != null)
+	{
+		toText = "";
+		try
+		{
+			toText = run.get("Param_Created_To").toString().toDate().toString("yyyy-MM-dd");
+		}
+		catch (e3)
+		{
+			toText = run.get("Param_Created_To").toString().subString(0,10);
+		}
+		toCond = "Created_Time <= '" + toText + "T23:59:59+09:00'";
+	}
+	// Pairwise-parenthesised condition builder (knowledge base 2.3: and/or must join exactly two terms)
+	rangeCond = "(id > '" + cursor + "')";
+	if(fromCond != "")
+	{
+		rangeCond = "(" + rangeCond + " and " + fromCond + ")";
+	}
+	if(toCond != "")
+	{
+		rangeCond = "(" + rangeCond + " and " + toCond + ")";
+	}
+	// Per-rule COQL field lists (page read and stale recheck). L1 strings are the v1.3 strings.
+	selectFields = "id, Created_Time, Modified_Time, BF_Registered_Date, BF_Days_Since_Created, BF_Age_Bucket";
+	recheckFields = "id, Modified_Time, BF_Days_Since_Created, BF_Age_Bucket";
+	if(ruleId == "L2")
+	{
+		selectFields = "id, Modified_Time, BF_Registered_Date, Lead_Status, BF_Stale_Flag, BF_Stale_Reason";
+		recheckFields = "id, Modified_Time";
+	}
+	else if(ruleId == "D1")
+	{
+		selectFields = "id, Modified_Time, Closing_Date, Stage, BF_Overdue_Flag, BF_Overdue_Days";
+		recheckFields = "id, Modified_Time";
+	}
+	// Ledger phase label for Execute rows (Backfill_Logs Phase picklist: DryRun / Execute / Retry)
+	execPhaseLabel = "Execute";
+	logTag = "-EX-";
+	if(pendingMode)
+	{
+		execPhaseLabel = "Retry";
+		logTag = "-RT-";
+	}
+	// Lock on
+	myToken = "core-" + rawNow.toString("yyyyMMddHHmmss");
+	lockMap = Map();
+	lockMap.put("Lock_Token",myToken);
+	if(phase == "Execute")
+	{
+		lockMap.put("Status","Running");
+	}
+	zoho.crm.updateRecord("Backfill_Runs",runId,lockMap);
+	// IDs embedded into COQL must be digits only (knowledge base 2.3, GHM measured)
+	try
+	{
+		cursorNumCheck = cursor.toLong();
+		if(boundary != "")
+		{
+			boundaryNumCheck = boundary.toLong();
+		}
+	}
+	catch (e4)
+	{
+		clearMap2 = Map();
+		clearMap2.put("Lock_Token","");
+		zoho.crm.updateRecord("Backfill_Runs",runId,clearMap2);
+		return "ERROR: cursor or boundary is not a numeric id";
+	}
+	// Boundary: freeze at dry run start (cursor mode only; Pending_IDs mode has an explicit id set)
+	if(boundary == "" && pendingMode == false)
+	{
+		bq = "select id from " + moduleName + " where " + rangeCond + " order by id desc limit 1";
+		bMap = Map();
+		bMap.put("select_query",bq);
+		bResp = invokeurl
+		[
+			url :api + "/coql"
+			type :POST
+			parameters:bMap.toString()
+			connection:"crm_module"
+		];
+		if(bResp == null || bResp.get("data") == null || bResp.get("data").size() == 0)
+		{
+			clearMap = Map();
+			clearMap.put("Lock_Token","");
+			zoho.crm.updateRecord("Backfill_Runs",runId,clearMap);
+			return "EMPTY: no target records";
+		}
+		boundary = bResp.get("data").get(0).get("id").toString();
+	}
+	// Counters (cumulative across invocations)
+	totEval = ifnull(run.get("Evaluated_Count"),0).toLong();
+	totSuccess = ifnull(run.get("Success_Count"),0).toLong();
+	totFailure = ifnull(run.get("Failure_Count"),0).toLong();
+	totNoChange = ifnull(run.get("Skipped_NoChange_Count"),0).toLong();
+	totStale = ifnull(run.get("Skipped_Stale_Count"),0).toLong();
+	totMissing = ifnull(run.get("Missing_Count"),0).toLong();
+	dryEval = ifnull(run.get("DryRun_Evaluated"),0).toLong();
+	dryChanged = ifnull(run.get("DryRun_Changed"),0).toLong();
+	// Pending_IDs mode: chunks of at most 100 ids, kept as comma-joined strings
+	chunkTexts = List();
+	if(pendingMode)
+	{
+		chunkCur = "";
+		chunkSize = 0;
+		for each pid in pendingList
+		{
+			if(chunkSize > 0)
+			{
+				chunkCur = chunkCur + ",";
+			}
+			chunkCur = chunkCur + pid;
+			chunkSize = chunkSize + 1;
+			if(chunkSize == 100)
+			{
+				chunkTexts.add(chunkCur);
+				chunkCur = "";
+				chunkSize = 0;
+			}
+		}
+		if(chunkSize > 0)
+		{
+			chunkTexts.add(chunkCur);
+		}
+	}
+	// Unit loop: cursor mode = at most 2 pages per invocation (v1.3); Pending mode = up to 10 chunks.
+	// Fixed lists because Deluge has no while.
+	pageSteps = {1,2};
+	if(pendingMode)
+	{
+		pageSteps = {1,2,3,4,5,6,7,8,9,10};
+	}
+	finished = false;
+	aborted = false;
+	abortReason = "";
+	for each pageStep in pageSteps
+	{
+		if(finished || aborted)
+		{
+			break;
+		}
+		// Operator stop / cancel check between pages (spec 7 and 13.1). The first page uses the status read at start.
+		if(pageStep > 1)
+		{
+			liveCheck = zoho.crm.getRecordById("Backfill_Runs",runId);
+			if(liveCheck != null)
+			{
+				liveCheckStatus = ifnull(liveCheck.get("Status"),"").toString();
+				if(liveCheckStatus == "Cancelled" || liveCheckStatus == "Paused_Manual")
+				{
+					break;
+				}
+			}
+		}
+		unitIds = List();
+		if(pendingMode)
+		{
+			if(pageStep > chunkTexts.size())
+			{
+				finished = true;
+				break;
+			}
+			chunkText = chunkTexts.get(pageStep - 1);
+			unitIds = chunkText.toList(",");
+			whereCond = "id in ('" + chunkText.replaceAll(",","','") + "')";
+		}
+		else
+		{
+			// Rebuild the page condition from the current cursor and the frozen boundary (v1.3).
+			pageCond = "((id > '" + cursor + "') and (id <= '" + boundary + "'))";
+			if(fromCond != "" || toCond != "")
+			{
+				inner = "(id > '" + cursor + "')";
+				if(fromCond != "")
+				{
+					inner = "(" + inner + " and " + fromCond + ")";
+				}
+				if(toCond != "")
+				{
+					inner = "(" + inner + " and " + toCond + ")";
+				}
+				pageCond = "(" + inner + " and (id <= '" + boundary + "'))";
+			}
+			whereCond = pageCond;
+		}
+		q = "select " + selectFields + " from " + moduleName + " where " + whereCond + " order by id limit 200";
+		qMap = Map();
+		qMap.put("select_query",q);
+		resp = invokeurl
+		[
+			url :api + "/coql"
+			type :POST
+			parameters:qMap.toString()
+			connection:"crm_module"
+		];
+		// Response handling. Cursor mode is exactly v1.3: empty body = abort, data null with code = abort,
+		// data null without code = finished, zero rows = finished.
+		// Pending mode: an empty body / data null without code (HTTP 204) means none of the chunk ids exist;
+		// they are recorded as MISSING below and nothing is written for them.
+		rows = List();
+		respEmpty = false;
+		if(resp == null || resp.toString() == "")
+		{
+			respEmpty = true;
+		}
+		if(respEmpty == true && pendingMode == false)
+		{
+			aborted = true;
+			abortReason = "COQL empty response";
+			break;
+		}
+		if(respEmpty == false)
+		{
+			if(resp.get("data") == null)
+			{
+				if(resp.get("code") != null)
+				{
+					aborted = true;
+					abortReason = "COQL error " + resp.get("code").toString();
+					break;
+				}
+				if(pendingMode == false)
+				{
+					finished = true;
+					break;
+				}
+			}
+			else
+			{
+				rows = resp.get("data");
+			}
+		}
+		if(rows.size() == 0 && pendingMode == false)
+		{
+			finished = true;
+			break;
+		}
+		// Evaluate the page
+		evalIds = List();
+		modTimes = Map();
+		proposals = Map();
+		for each rec in rows
+		{
+			rid = rec.get("id").toString();
+			evalIds.add(rid);
+			modTimes.put(rid,ifnull(rec.get("Modified_Time"),"").toString());
+			prop = Map();
+			if(ruleId == "L1")
+			{
+				srcText = "";
+				if(rec.get("BF_Registered_Date") != null)
+				{
+					srcText = rec.get("BF_Registered_Date").toString().subString(0,10);
+				}
+				else if(rec.get("Created_Time") != null)
+				{
+					srcText = rec.get("Created_Time").toString().subString(0,10);
+				}
+				if(srcText != "")
+				{
+					srcDate = srcText.toDate();
+					effDate = effectiveText.toDate();
+					diffMs = effDate.toLong() - srcDate.toLong();
+					days = (diffMs / 86400000).floor();
+					if(days < 0)
+					{
+						days = 0;
+					}
+					bucket = "Over365";
+					if(days <= 30)
+					{
+						bucket = "0-30";
+					}
+					else if(days <= 90)
+					{
+						bucket = "31-90";
+					}
+					else if(days <= 365)
+					{
+						bucket = "91-365";
+					}
+					prop.put("days",days);
+					prop.put("bucket",bucket);
+					curDays = "-1";
+					if(rec.get("BF_Days_Since_Created") != null)
+					{
+						curDays = rec.get("BF_Days_Since_Created").toLong().toString();
+					}
+					curBucket = "";
+					if(rec.get("BF_Age_Bucket") != null)
+					{
+						curBucket = rec.get("BF_Age_Bucket").toString();
+					}
+					prop.put("changed",false);
+					if(curDays != days.toString() || curBucket != bucket)
+					{
+						prop.put("changed",true);
+					}
+					prop.put("curDays",curDays);
+					prop.put("curBucket",curBucket);
+				}
+				else
+				{
+					prop.put("changed",false);
+					prop.put("unevaluated",true);
+				}
+			}
+			else
+			{
+				// L2 / D1: primitive string arguments to the pure evaluator, Map back
+				aFlag = "";
+				aSecond = "";
+				curText = "";
+				ev = Map();
+				if(ruleId == "L2")
+				{
+					aReg = "";
+					if(rec.get("BF_Registered_Date") != null)
+					{
+						aReg = rec.get("BF_Registered_Date").toString();
+					}
+					aStatus = "";
+					if(rec.get("Lead_Status") != null)
+					{
+						aStatus = rec.get("Lead_Status").toString();
+					}
+					if(rec.get("BF_Stale_Flag") != null)
+					{
+						aFlag = rec.get("BF_Stale_Flag").toString();
+					}
+					if(rec.get("BF_Stale_Reason") != null)
+					{
+						aSecond = rec.get("BF_Stale_Reason").toString();
+					}
+					// The evaluator returns the String form of its result Map (standalone returns String only); convert it back.
+					evText = standalone.bf_evaluateL2(aReg,aStatus,effectiveText,aFlag,aSecond);
+					if(evText != null && evText != "")
+					{
+						ev = evText.toMap();
+					}
+				}
+				else
+				{
+					aClose = "";
+					if(rec.get("Closing_Date") != null)
+					{
+						aClose = rec.get("Closing_Date").toString();
+					}
+					aStage = "";
+					if(rec.get("Stage") != null)
+					{
+						aStage = rec.get("Stage").toString();
+					}
+					if(rec.get("BF_Overdue_Flag") != null)
+					{
+						aFlag = rec.get("BF_Overdue_Flag").toString();
+					}
+					if(rec.get("BF_Overdue_Days") != null)
+					{
+						aSecond = rec.get("BF_Overdue_Days").toString();
+					}
+					// The evaluator returns the String form of its result Map (standalone returns String only); convert it back.
+					evText = standalone.bf_evaluateD1(aClose,aStage,effectiveText,aFlag,aSecond);
+					if(evText != null && evText != "")
+					{
+						ev = evText.toMap();
+					}
+				}
+				// Current values kept in full in the ledger so that they can be restored (spec 13.6)
+				curText = aFlag + "/" + aSecond;
+				evChange = false;
+				evOutcome = "EXCLUDED";
+				evDetail = "evaluator returned nothing";
+				evWrites = Map();
+				if(ev != null)
+				{
+					if(ev.get("change") == true)
+					{
+						evChange = true;
+					}
+					if(ev.get("outcome") != null)
+					{
+						evOutcome = ev.get("outcome").toString();
+					}
+					if(ev.get("detail") != null)
+					{
+						evDetail = ev.get("detail").toString();
+					}
+					if(ev.get("writes") != null)
+					{
+						evWrites = ev.get("writes");
+					}
+				}
+				prop.put("changed",evChange);
+				prop.put("outcome",evOutcome);
+				prop.put("detail",evDetail);
+				prop.put("writes",evWrites);
+				prop.put("curText",curText);
+			}
+			proposals.put(rid,prop);
+		}
+		// Pending mode: ids of the chunk that did not come back
+		fetchMissing = List();
+		if(pendingMode)
+		{
+			for each uid0 in unitIds
+			{
+				if(proposals.get(uid0) == null)
+				{
+					fetchMissing.add(uid0);
+				}
+			}
+		}
+		if(evalIds.size() > 0)
+		{
+			pageLastId = evalIds.get(evalIds.size() - 1);
+			if(phase == "DryRun")
+			{
+				changedCount = 0;
+				detail = "";
+				idText = "";
+				for each rid2 in evalIds
+				{
+					idText = idText + rid2 + ",";
+					p2 = proposals.get(rid2);
+					if(p2.get("changed") == true)
+					{
+						changedCount = changedCount + 1;
+						if(ruleId == "L1")
+						{
+							detail = detail + rid2 + ":" + p2.get("curDays") + "/" + p2.get("curBucket") + "->" + p2.get("days").toString() + "/" + p2.get("bucket") + " | ";
+						}
+						else
+						{
+							detail = detail + rid2 + ":" + p2.get("curText") + "->" + p2.get("detail") + " | ";
+						}
+					}
+					else if(ruleId != "L1")
+					{
+						if(p2.get("outcome") == "EXCLUDED")
+						{
+							detail = detail + rid2 + ":EXCLUDED(" + p2.get("detail") + ") | ";
+						}
+					}
+				}
+				// Proposed_Detail is multi-line (large, 32,000 chars). L1 lines never get near this; L2 reasons can.
+				if(detail.length() > 30000)
+				{
+					detail = detail.subString(0,30000) + " ...TRUNCATED";
+				}
+				dryEval = dryEval + evalIds.size();
+				dryChanged = dryChanged + changedCount;
+				logMap = Map();
+				logMap.put("Name","RUN" + runId.toString() + "-DR-" + pageStep.toString() + "-" + pageLastId);
+				logMap.put("Run",runId);
+				logMap.put("Log_Type","Batch");
+				logMap.put("Phase","DryRun");
+				logMap.put("Batch_No",pageStep);
+				logMap.put("Evaluated_IDs",idText);
+				logMap.put("Proposed_Detail",detail);
+				logMap.put("Last_ID_In_Batch",pageLastId);
+				logMap.put("Batch_Evaluated",evalIds.size());
+				logMap.put("Batch_Success",0);
+				logMap.put("Batch_Failure",0);
+				logMap.put("Batch_Skipped",evalIds.size() - changedCount);
+				zoho.crm.createRecord("Backfill_Logs",logMap);
+				if(pendingMode == false)
+				{
+					cursor = pageLastId;
+					if(rows.size() < 200)
+					{
+						finished = true;
+					}
+				}
+			}
+			else
+			{
+				// Execute phase: split the page into batches of 100 by index
+				batchSteps = {0,100};
+				for each bStart in batchSteps
+				{
+					if(aborted)
+					{
+						break;
+					}
+					if(bStart >= evalIds.size())
+					{
+						break;
+					}
+					bEnd = bStart + 100;
+					if(bEnd > evalIds.size())
+					{
+						bEnd = evalIds.size();
+					}
+					batchIds = List();
+					idxList = List();
+					for each rid3 in evalIds
+					{
+						idxList.add(rid3);
+					}
+					// Position counter must start at 0 (v1.3 fix: starting at bStart
+					// re-selected the first 100 ids for batch 2; the stale guard caught
+					// them, but the batch never reached ids 101-200 of the page)
+					bi = 0;
+					lastBatchId = "";
+					for each stepX in idxList
+					{
+						if(bi >= bStart && bi < bEnd)
+						{
+							batchIds.add(stepX);
+							lastBatchId = stepX;
+						}
+						bi = bi + 1;
+					}
+					// Intent log first
+					bIdText = "";
+					propText = "";
+					for each bid in batchIds
+					{
+						bIdText = bIdText + bid + ",";
+						pb = proposals.get(bid);
+						if(pb.get("changed") == true)
+						{
+							if(ruleId == "L1")
+							{
+								propText = propText + bid + ":" + pb.get("curDays") + "/" + pb.get("curBucket") + "->" + pb.get("days").toString() + "/" + pb.get("bucket") + " | ";
+							}
+							else
+							{
+								propText = propText + bid + ":" + pb.get("curText") + "->" + pb.get("detail") + " | ";
+							}
+						}
+					}
+					if(propText.length() > 30000)
+					{
+						propText = propText.subString(0,30000) + " ...TRUNCATED";
+					}
+					intentTag = cursor;
+					if(pendingMode)
+					{
+						intentTag = pageStep.toString();
+					}
+					iMap = Map();
+					iMap.put("Name","RUN" + runId.toString() + logTag + intentTag + "-" + lastBatchId);
+					iMap.put("Run",runId);
+					iMap.put("Log_Type","Batch");
+					iMap.put("Phase",execPhaseLabel);
+					iMap.put("Batch_No",(pageStep - 1) * 2 + bStart / 100 + 1);
+					iMap.put("State","Intent");
+					iMap.put("Evaluated_IDs",bIdText);
+					iMap.put("Proposed_Detail",propText);
+					iMap.put("Last_ID_In_Batch",lastBatchId);
+					iMap.put("Batch_Evaluated",batchIds.size());
+					intentResp = zoho.crm.createRecord("Backfill_Logs",iMap);
+					intentId = intentResp.get("id").toLong();
+					// Stale recheck by COQL in-list (common to all rules: Modified_Time comparison)
+					inListQuoted = "";
+					firstIn = true;
+					for each bid2 in batchIds
+					{
+						if(firstIn == false)
+						{
+							inListQuoted = inListQuoted + "','";
+						}
+						inListQuoted = inListQuoted + bid2;
+						firstIn = false;
+					}
+					rq = "select " + recheckFields + " from " + moduleName + " where id in ('" + inListQuoted + "')";
+					rMap = Map();
+					rMap.put("select_query",rq);
+					rResp = invokeurl
+					[
+						url :api + "/coql"
+						type :POST
+						parameters:rMap.toString()
+						connection:"crm_module"
+					];
+					if(rResp == null || rResp.get("data") == null)
+					{
+						aborted = true;
+						abortReason = "stale recheck failed";
+						break;
+					}
+					current = Map();
+					for each rr in rResp.get("data")
+					{
+						current.put(rr.get("id").toString(),rr);
+					}
+					updRows = List();
+					updIds = List();
+					bSuccess = 0;
+					bFailure = 0;
+					bSkipped = 0;
+					outcomeText = "";
+					for each bid3 in batchIds
+					{
+						p3 = proposals.get(bid3);
+						if(current.get(bid3) == null)
+						{
+							totMissing = totMissing + 1;
+							bSkipped = bSkipped + 1;
+							outcomeText = outcomeText + bid3 + ":MISSING | ";
+						}
+						else if(current.get(bid3).get("Modified_Time").toString() != modTimes.get(bid3))
+						{
+							totStale = totStale + 1;
+							bSkipped = bSkipped + 1;
+							outcomeText = outcomeText + bid3 + ":STALE | ";
+						}
+						else if(p3.get("changed") == false)
+						{
+							// EXCLUDED records (L2/D1) are counted with NoChange so that the sum still equals Evaluated
+							totNoChange = totNoChange + 1;
+							bSkipped = bSkipped + 1;
+							noChangeTag = ":NOCHANGE | ";
+							if(ruleId != "L1")
+							{
+								if(p3.get("outcome") == "EXCLUDED")
+								{
+									noChangeTag = ":EXCLUDED | ";
+								}
+							}
+							outcomeText = outcomeText + bid3 + noChangeTag;
+						}
+						else
+						{
+							row = Map();
+							row.put("id",bid3.toLong());
+							if(ruleId == "L1")
+							{
+								row.put("BF_Days_Since_Created",p3.get("days"));
+								row.put("BF_Age_Bucket",p3.get("bucket"));
+							}
+							else
+							{
+								wm = p3.get("writes");
+								for each wk in wm.keys()
+								{
+									row.put(wk,wm.get(wk));
+								}
+							}
+							updRows.add(row);
+							updIds.add(bid3);
+						}
+					}
+					totEval = totEval + batchIds.size();
+					if(updRows.size() > 0)
+					{
+						putBody = Map();
+						putBody.put("data",updRows);
+						putBody.put("trigger",List());
+						putResp = invokeurl
+						[
+							url :api + "/" + moduleName
+							type :PUT
+							parameters:putBody.toString()
+							connection:"crm_module"
+						];
+						if(putResp == null || putResp.get("data") == null)
+						{
+							aborted = true;
+							abortReason = "update response missing";
+							// Do not advance the cursor for this batch; ids stay reconcilable via the Intent log
+							break;
+						}
+						pos = 0;
+						for each resRow in putResp.get("data")
+						{
+							uid = updIds.get(pos);
+							code = ifnull(resRow.get("code"),"").toString();
+							if(code == "SUCCESS")
+							{
+								bSuccess = bSuccess + 1;
+								totSuccess = totSuccess + 1;
+								outcomeText = outcomeText + uid + ":SUCCESS | ";
+							}
+							else
+							{
+								bFailure = bFailure + 1;
+								totFailure = totFailure + 1;
+								outcomeText = outcomeText + uid + ":FAIL:" + code + " | ";
+								fMap = Map();
+								fMap.put("Name","RUN" + runId.toString() + "-FAIL-" + uid);
+								fMap.put("Run",runId);
+								fMap.put("Log_Type","Failure");
+								fMap.put("Phase",execPhaseLabel);
+								fMap.put("Target_Identifier",uid);
+								fMap.put("Error_Code",code);
+								fMap.put("Error_Message",ifnull(resRow.get("message"),"").toString());
+								zoho.crm.createRecord("Backfill_Logs",fMap);
+							}
+							pos = pos + 1;
+						}
+					}
+					// Outcome on the intent log, then advance the cursor (cursor mode only)
+					oMap = Map();
+					oMap.put("State","Outcome");
+					oMap.put("Outcome_Detail",outcomeText);
+					oMap.put("Batch_Success",bSuccess);
+					oMap.put("Batch_Failure",bFailure);
+					oMap.put("Batch_Skipped",bSkipped);
+					zoho.crm.updateRecord("Backfill_Logs",intentId,oMap);
+					if(pendingMode == false)
+					{
+						cursor = lastBatchId;
+					}
+					// Failure stop conditions (spec 13.5, simplified as in v1.3)
+					if(bFailure > 0 && totFailure >= 200)
+					{
+						aborted = true;
+						abortReason = "failure cap reached";
+						break;
+					}
+				}
+				if(pendingMode == false && rows.size() < 200)
+				{
+					finished = true;
+				}
+			}
+		}
+		// Pending mode: one ledger Batch row for the ids that no longer exist (no write is attempted for them)
+		if(pendingMode && aborted == false && fetchMissing.size() > 0)
+		{
+			missIdText = "";
+			missOutcome = "";
+			for each mid in fetchMissing
+			{
+				missIdText = missIdText + mid + ",";
+				missOutcome = missOutcome + mid + ":MISSING | ";
+			}
+			mMap = Map();
+			mMap.put("Name","RUN" + runId.toString() + "-RTMISS-" + pageStep.toString());
+			mMap.put("Run",runId);
+			mMap.put("Log_Type","Batch");
+			mMap.put("Batch_No",pageStep);
+			mMap.put("Evaluated_IDs",missIdText);
+			mMap.put("Outcome_Detail",missOutcome);
+			mMap.put("Batch_Evaluated",fetchMissing.size());
+			mMap.put("Batch_Success",0);
+			mMap.put("Batch_Failure",0);
+			mMap.put("Batch_Skipped",fetchMissing.size());
+			if(phase == "DryRun")
+			{
+				mMap.put("Phase","DryRun");
+				dryEval = dryEval + fetchMissing.size();
+			}
+			else
+			{
+				mMap.put("Phase",execPhaseLabel);
+				mMap.put("State","Outcome");
+				totEval = totEval + fetchMissing.size();
+				totMissing = totMissing + fetchMissing.size();
+			}
+			zoho.crm.createRecord("Backfill_Logs",mMap);
+		}
+		if(pendingMode && aborted == false && pageStep >= chunkTexts.size())
+		{
+			finished = true;
+		}
+	}
+	// Re-read the Run before persisting (spec 13.1): an operator may have stopped or cancelled it meanwhile.
+	liveRun = zoho.crm.getRecordById("Backfill_Runs",runId);
+	liveStatus = "";
+	liveLock = "";
+	if(liveRun != null)
+	{
+		liveStatus = ifnull(liveRun.get("Status"),"").toString();
+		liveLock = ifnull(liveRun.get("Lock_Token"),"").toString();
+	}
+	if(liveStatus == "Cancelled" || liveStatus == "Completed" || liveStatus == "CompletedWithErrors" || liveStatus == "Failed")
+	{
+		return "STOPPED: run became " + liveStatus + " during this invocation; nothing persisted (ledger rows in Backfill Logs). phase=" + phase + " cursor=" + cursor;
+	}
+	if(liveStatus == "Paused_Manual")
+	{
+		// Operator stop: keep the operator's Status, persist progress so that a later requeue resumes from here.
+		pm1 = Map();
+		pm1.put("Boundary_Max_ID",boundary);
+		pm1.put("Effective_Date",effectiveText);
+		zoho.crm.updateRecord("Backfill_Runs",runId,pm1);
+		pm2 = Map();
+		if(phase == "DryRun")
+		{
+			if(pendingMode == false)
+			{
+				pm2.put("DryRun_Cursor",cursor);
+			}
+			pm2.put("DryRun_Evaluated",dryEval);
+			pm2.put("DryRun_Changed",dryChanged);
+		}
+		else
+		{
+			if(pendingMode == false)
+			{
+				pm2.put("Exec_Cursor",cursor);
+			}
+			pm2.put("Evaluated_Count",totEval);
+			pm2.put("Success_Count",totSuccess);
+			pm2.put("Failure_Count",totFailure);
+		}
+		zoho.crm.updateRecord("Backfill_Runs",runId,pm2);
+		if(phase == "Execute")
+		{
+			pm3 = Map();
+			pm3.put("Skipped_NoChange_Count",totNoChange);
+			pm3.put("Skipped_Stale_Count",totStale);
+			pm3.put("Missing_Count",totMissing);
+			zoho.crm.updateRecord("Backfill_Runs",runId,pm3);
+		}
+		if(liveLock == myToken)
+		{
+			pm4 = Map();
+			pm4.put("Lock_Token","");
+			zoho.crm.updateRecord("Backfill_Runs",runId,pm4);
+		}
+		pmVerify = zoho.crm.getRecordById("Backfill_Runs",runId);
+		pmOk = false;
+		if(pmVerify != null)
+		{
+			if(phase == "DryRun")
+			{
+				if(ifnull(pmVerify.get("DryRun_Evaluated"),0).toLong() == dryEval)
+				{
+					pmOk = true;
+				}
+			}
+			else
+			{
+				if(ifnull(pmVerify.get("Evaluated_Count"),0).toLong() == totEval)
+				{
+					pmOk = true;
+				}
+			}
+		}
+		return "STOPPED phase=" + phase + " status=Paused Manual (operator stop honoured) cursor=" + cursor + " persistVerified=" + pmOk.toString();
+	}
+	// Persist run state (v1.2 grouped persist, measured 2026-11-10:
+	// one bundled updateRecord with 11 fields returned PUT 202 and silently
+	// applied nothing; the same values in small groups all applied with 200.
+	// DryRun_At is passed as an offset ISO string, not a native DateTime object,
+	// and the persist is verified by reading the Run back.)
+	g1 = Map();
+	g1.put("Boundary_Max_ID",boundary);
+	g1.put("Effective_Date",effectiveText);
+	zoho.crm.updateRecord("Backfill_Runs",runId,g1);
+	finalStatus = "";
+	if(phase == "DryRun")
+	{
+		g2 = Map();
+		if(pendingMode == false)
+		{
+			g2.put("DryRun_Cursor",cursor);
+		}
+		g2.put("DryRun_Evaluated",dryEval);
+		g2.put("DryRun_Changed",dryChanged);
+		zoho.crm.updateRecord("Backfill_Runs",runId,g2);
+		if(aborted)
+		{
+			finalStatus = "Paused_Manual";
+		}
+		else if(finished)
+		{
+			finalStatus = "DryRunDone";
+			summaryText = "evaluated=" + dryEval.toString() + " changed=" + dryChanged.toString() + " (detail in Backfill Logs, Phase=DryRun)";
+			if(ruleId != "L1")
+			{
+				summaryText = summaryText + " rule=" + ruleId + " " + codeVersion + "; records that could not be evaluated are marked EXCLUDED in Proposed_Detail";
+			}
+			if(ruleId == "D1")
+			{
+				summaryText = summaryText + "; Closed stage list = Closed Won / Closed Lost / Closed Lost to Competitor (org values confirmed 2026-11-12)";
+			}
+			g3 = Map();
+			g3.put("DryRun_At",nowIsoJst);
+			g3.put("Config_Fingerprint",ruleId + "|" + ifnull(run.get("Rule_Version"),"") + "|" + boundary + "|" + effectiveText);
+			g3.put("Time_Offset_Minutes",shiftHours * 60);
+			g3.put("DryRun_Summary",summaryText);
+			zoho.crm.updateRecord("Backfill_Runs",runId,g3);
+		}
+		else
+		{
+			finalStatus = "DryRunning";
+		}
+	}
+	else
+	{
+		g2 = Map();
+		if(pendingMode == false)
+		{
+			g2.put("Exec_Cursor",cursor);
+		}
+		g2.put("Evaluated_Count",totEval);
+		g2.put("Success_Count",totSuccess);
+		g2.put("Failure_Count",totFailure);
+		g2.put("Skipped_NoChange_Count",totNoChange);
+		g2.put("Skipped_Stale_Count",totStale);
+		g2.put("Missing_Count",totMissing);
+		zoho.crm.updateRecord("Backfill_Runs",runId,g2);
+		if(aborted)
+		{
+			finalStatus = "Paused_Manual";
+		}
+		else if(finished)
+		{
+			if(totFailure > 0)
+			{
+				finalStatus = "CompletedWithErrors";
+			}
+			else
+			{
+				finalStatus = "Completed";
+			}
+		}
+		else
+		{
+			finalStatus = "Paused_Budget";
+		}
+	}
+	g4 = Map();
+	g4.put("Status",finalStatus);
+	if(aborted)
+	{
+		g4.put("Error_Summary",abortReason);
+	}
+	zoho.crm.updateRecord("Backfill_Runs",runId,g4);
+	g5 = Map();
+	g5.put("Lock_Token","");
+	zoho.crm.updateRecord("Backfill_Runs",runId,g5);
+	// Verify the persist actually applied (a 2xx response alone proved nothing)
+	verifyRun = zoho.crm.getRecordById("Backfill_Runs",runId);
+	persistOk = false;
+	if(verifyRun != null && ifnull(verifyRun.get("Status"),"") == finalStatus && ifnull(verifyRun.get("Lock_Token"),"") == "")
+	{
+		persistOk = true;
+	}
+	modeText = "cursor";
+	if(pendingMode)
+	{
+		modeText = "pending";
+	}
+	return "OK phase=" + phase + " rule=" + ruleId + " mode=" + modeText + " cursor=" + cursor + " finished=" + finished.toString() + " aborted=" + aborted.toString() + " persistVerified=" + persistOk.toString() + " " + abortReason;
+}

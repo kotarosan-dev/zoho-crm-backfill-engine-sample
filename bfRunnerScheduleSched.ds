@@ -1,0 +1,88 @@
+void schedule.bf_runnerScheduleSched()
+{
+// Backfill engine - schedule wrapper, Schedule category version (2026-11-12, Phase 2)
+// In the Schedule category, void schedule.<name> is the correct form and saves (measured 2026-11-12). It can be selected on the Schedules screen. The body is the same as the standalone version.
+// Same logic as deluge/bfRunnerSchedule.ds (string standalone.bf_runnerSchedule, v2):
+//   picks at most 2 runnable Runs (Status Queued or Paused_Budget, oldest Created_Time first) with COQL on
+//   Backfill_Runs and calls standalone.bf_runnerCore once for each, one after the other (no parallel runs).
+// Differences from the standalone version: no return value (Schedule category returns void, knowledge base 5.2),
+//   so the run summary (and its 120-character cut) is not built; the function ends with info lines only.
+//   The info lines are the same as the standalone version, with the function name shown as bf_runnerScheduleSched.
+// Measured on 2026-11-12: the declaration void schedule.bf_runnerScheduleSched() is the editor default and saves;
+//   calling standalone.bf_runnerCore from this Schedule function saves without error.
+//   COQL on Backfill_Runs works; no rows comes back as HTTP 204 (empty body).
+//   The actual timed firing of a schedule is NOT verified (no schedule was created in the shared org).
+// The Runner itself refuses locked runs (TC-13), mismatched versions (TC-12) and other statuses.
+// If the query fails, this wrapper only writes the reason with info and ends normally. It never guesses
+// a Run id and never falls back to Search (Search has an index delay; knowledge base 2.1).
+	api = "https://www.zohoapis.jp/crm/v8";
+	q = "select id, Name, Status, Created_Time from Backfill_Runs where Status in ('Queued','Paused_Budget') order by Created_Time asc limit 2";
+	qMap = Map();
+	qMap.put("select_query",q);
+	resp = Map();
+	coqlOk = true;
+	failReason = "";
+	try
+	{
+		resp = invokeurl
+		[
+			url :api + "/coql"
+			type :POST
+			parameters:qMap.toString()
+			connection:"crm_module"
+		];
+	}
+	catch (eQ)
+	{
+		coqlOk = false;
+		failReason = "COQL call raised an exception: " + eQ.toString();
+	}
+	runIds = List();
+	if(coqlOk)
+	{
+		if(resp == null || resp.toString() == "")
+		{
+			info "bf_runnerScheduleSched: no runnable run (empty COQL response)";
+		}
+		else if(resp.get("data") == null)
+		{
+			if(resp.get("code") != null)
+			{
+				coqlOk = false;
+				failReason = "COQL on Backfill_Runs failed: " + resp.get("code").toString() + " " + ifnull(resp.get("message"),"").toString();
+			}
+			else
+			{
+				info "bf_runnerScheduleSched: no runnable run";
+			}
+		}
+		else
+		{
+			for each r in resp.get("data")
+			{
+				if(r.get("id") != null)
+				{
+					runIds.add(r.get("id").toString());
+				}
+			}
+		}
+	}
+	if(coqlOk == false)
+	{
+		info "bf_runnerScheduleSched: ended without running anything. " + failReason;
+	}
+	for each rid in runIds
+	{
+		try
+		{
+			result = standalone.bf_runnerCore(rid);
+			info "bf_runnerScheduleSched: run " + rid + " -> " + result;
+		}
+		catch (eR)
+		{
+			info "bf_runnerScheduleSched: run " + rid + " raised an exception: " + eR.toString();
+		}
+	}
+	attempted = runIds.size().toString();
+	info "bf_runnerScheduleSched: done, runs attempted=" + attempted;
+}

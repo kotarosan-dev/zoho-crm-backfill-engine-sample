@@ -1,0 +1,295 @@
+string standalone.bf_makeRetryRun(String runIdText)
+{
+// Backfill engine - Retry Run maker (standalone) DRAFT v1, 2026-11-11 (Phase 2, TC-18)
+// Collects the Target_Identifier of every Log_Type = Failure row of the given Run (COQL on Backfill_Logs,
+// duplicates removed) and creates a new Run that the Runner processes in Pending_IDs mode.
+// New Run fields:
+//   Name = original Name + "-RETRY", Run_Type = Retry, Retry_Of = original Run,
+//   Rule_ID / Target_Module / Rule_Version / Effective_Date / Config_Fingerprint = inherited,
+//   Boundary_Max_ID = inherited too (the Runner fingerprint formula includes it, so without it the
+//   inherited fingerprint could never match and the Retry Run would always be refused),
+//   Pending_IDs = comma separated ids (max 1,000), Status = Queued.
+// Safety: the Run is created as Draft, every field is written in small groups and read back,
+// and only then Status is set to Queued. A failed verification leaves the new Run in Draft.
+// A Retry Run has no dry run of its own: it re-applies the approved, frozen configuration of the
+// original Run to the failed ids only (bf_validateRun reports this as N/A for the freshness check).
+// No Failure rows = nothing is created. Nothing is written to Leads / Deals here.
+// COQL on the custom modules Backfill_Runs / Backfill_Logs works in this org (measured 2026-11-12):
+// rows found = HTTP 200, no rows = HTTP 204 (empty body).
+// Related: standalone.bf_runnerCore (Pending_IDs mode), standalone.bf_validateRun.
+	api = "https://www.zohoapis.jp/crm/v8";
+	pendingMax = 1000;
+	// The id is embedded into COQL: digits only (knowledge base 2.3)
+	srcIdText = "";
+	if(runIdText != null)
+	{
+		srcIdText = runIdText.trim();
+	}
+	idOk = false;
+	try
+	{
+		srcIdNum = srcIdText.toLong();
+		if(srcIdNum > 0 && srcIdNum.toString() == srcIdText)
+		{
+			idOk = true;
+		}
+	}
+	catch (eId)
+	{
+		idOk = false;
+	}
+	if(idOk == false)
+	{
+		return "ERROR: run id must be digits only";
+	}
+	runId = srcIdText.toLong();
+	src = zoho.crm.getRecordById("Backfill_Runs",runId);
+	if(src == null)
+	{
+		return "ERROR: run not found";
+	}
+	srcStatus = ifnull(src.get("Status"),"").toString();
+	srcLock = ifnull(src.get("Lock_Token"),"").toString();
+	activeStatuses = {"Draft","DryRunning","DryRunDone","Queued","Running"};
+	if(activeStatuses.contains(srcStatus))
+	{
+		return "NOT CREATED: original run status is " + srcStatus + "; a retry run is made only after the original has executed and stopped";
+	}
+	if(srcLock != "")
+	{
+		return "NOT CREATED: original run still holds a lock token (" + srcLock + ")";
+	}
+	// Failure rows of this run
+	q = "select Target_Identifier from Backfill_Logs where ((Run = '" + srcIdText + "') and (Log_Type = 'Failure')) limit 2000";
+	qMap = Map();
+	qMap.put("select_query",q);
+	resp = invokeurl
+	[
+		url :api + "/coql"
+		type :POST
+		parameters:qMap.toString()
+		connection:"crm_module"
+	];
+	failRows = List();
+	if(resp != null && resp.toString() != "")
+	{
+		if(resp.get("data") == null)
+		{
+			if(resp.get("code") != null)
+			{
+				return "ERROR: COQL on Backfill Logs failed: " + resp.get("code").toString() + " " + ifnull(resp.get("message"),"").toString();
+			}
+		}
+		else
+		{
+			failRows = resp.get("data");
+			respInfo = resp.get("info");
+			if(respInfo != null)
+			{
+				if(respInfo.get("more_records") == true)
+				{
+					return "NOT CREATED: more than 2000 Failure rows; above the retry limit of 1000";
+				}
+			}
+		}
+	}
+	seenIds = Map();
+	idList = List();
+	badCount = 0;
+	for each fr in failRows
+	{
+		tid = "";
+		if(fr.get("Target_Identifier") != null)
+		{
+			tid = fr.get("Target_Identifier").toString().trim();
+		}
+		tOk = false;
+		if(tid != "")
+		{
+			try
+			{
+				tNum = tid.toLong();
+				if(tNum > 0 && tNum.toString() == tid)
+				{
+					tOk = true;
+				}
+			}
+			catch (eT)
+			{
+				tOk = false;
+			}
+		}
+		if(tOk == false)
+		{
+			badCount = badCount + 1;
+		}
+		else if(seenIds.get(tid) == null)
+		{
+			seenIds.put(tid,true);
+			idList.add(tid);
+		}
+	}
+	failRowCount = failRows.size();
+	if(idList.size() == 0)
+	{
+		return "NOT CREATED: run " + srcIdText + " has no Failure log with a valid target id (failure rows=" + failRowCount.toString() + ", invalid=" + badCount.toString() + ")";
+	}
+	if(idList.size() > pendingMax)
+	{
+		return "NOT CREATED: " + idList.size().toString() + " failed ids, above the retry limit of 1000";
+	}
+	pendingText = "";
+	firstP = true;
+	for each pid in idList
+	{
+		if(firstP == false)
+		{
+			pendingText = pendingText + ",";
+		}
+		pendingText = pendingText + pid;
+		firstP = false;
+	}
+	// Inherited values
+	srcName = ifnull(src.get("Name"),"").toString();
+	newName = srcName + "-RETRY";
+	srcRule = ifnull(src.get("Rule_ID"),"").toString();
+	srcModule = ifnull(src.get("Target_Module"),"").toString();
+	srcVersion = ifnull(src.get("Rule_Version"),"").toString();
+	srcFp = ifnull(src.get("Config_Fingerprint"),"").toString();
+	srcBoundary = ifnull(src.get("Boundary_Max_ID"),"").toString();
+	srcEffective = "";
+	if(src.get("Effective_Date") != null)
+	{
+		try
+		{
+			srcEffective = src.get("Effective_Date").toString().toDate().toString("yyyy-MM-dd");
+		}
+		catch (eEff)
+		{
+			srcEffective = src.get("Effective_Date").toString().subString(0,10);
+		}
+	}
+	if(srcRule == "" || srcVersion == "" || srcEffective == "")
+	{
+		return "NOT CREATED: original run lacks Rule ID, Rule Version or Effective Date";
+	}
+	// Create as Draft first (not visible to the schedule wrapper)
+	c0 = Map();
+	c0.put("Name",newName);
+	c0.put("Rule_ID",srcRule);
+	c0.put("Target_Module",srcModule);
+	c0.put("Run_Type","Retry");
+	c0.put("Status","Draft");
+	createResp = zoho.crm.createRecord("Backfill_Runs",c0);
+	if(createResp == null)
+	{
+		return "ERROR: retry run creation failed: no response";
+	}
+	if(createResp.get("id") == null)
+	{
+		return "ERROR: retry run creation failed: " + createResp.toString();
+	}
+	newId = createResp.get("id").toLong();
+	// Grouped writes (Runner v1.2 lesson: a bundled updateRecord can silently apply nothing)
+	c1 = Map();
+	c1.put("Rule_Version",srcVersion);
+	c1.put("Effective_Date",srcEffective);
+	zoho.crm.updateRecord("Backfill_Runs",newId,c1);
+	c2 = Map();
+	c2.put("Config_Fingerprint",srcFp);
+	c2.put("Boundary_Max_ID",srcBoundary);
+	zoho.crm.updateRecord("Backfill_Runs",newId,c2);
+	c3 = Map();
+	c3.put("Retry_Of",runId);
+	zoho.crm.updateRecord("Backfill_Runs",newId,c3);
+	c4 = Map();
+	c4.put("Pending_IDs",pendingText);
+	zoho.crm.updateRecord("Backfill_Runs",newId,c4);
+	// Read back every inherited field before queueing
+	chk = zoho.crm.getRecordById("Backfill_Runs",newId);
+	problems = "";
+	if(chk == null)
+	{
+		problems = "read-back failed";
+	}
+	else
+	{
+		if(ifnull(chk.get("Rule_ID"),"").toString() != srcRule)
+		{
+			problems = problems + " Rule ID";
+		}
+		if(ifnull(chk.get("Target_Module"),"").toString() != srcModule)
+		{
+			problems = problems + " Target Module";
+		}
+		if(ifnull(chk.get("Run_Type"),"").toString() != "Retry")
+		{
+			problems = problems + " Run Type";
+		}
+		if(ifnull(chk.get("Rule_Version"),"").toString() != srcVersion)
+		{
+			problems = problems + " Rule Version";
+		}
+		if(ifnull(chk.get("Config_Fingerprint"),"").toString() != srcFp)
+		{
+			problems = problems + " Config Fingerprint";
+		}
+		if(ifnull(chk.get("Boundary_Max_ID"),"").toString() != srcBoundary)
+		{
+			problems = problems + " Boundary";
+		}
+		if(ifnull(chk.get("Pending_IDs"),"").toString().trim() != pendingText)
+		{
+			problems = problems + " Pending IDs";
+		}
+		chkEff = "";
+		if(chk.get("Effective_Date") != null)
+		{
+			try
+			{
+				chkEff = chk.get("Effective_Date").toString().toDate().toString("yyyy-MM-dd");
+			}
+			catch (eChk)
+			{
+				chkEff = chk.get("Effective_Date").toString().subString(0,10);
+			}
+		}
+		if(chkEff != srcEffective)
+		{
+			problems = problems + " Effective Date";
+		}
+		retryOf = chk.get("Retry_Of");
+		retryOfOk = false;
+		if(retryOf != null)
+		{
+			if(retryOf.get("id") != null)
+			{
+				if(retryOf.get("id").toString() == srcIdText)
+				{
+					retryOfOk = true;
+				}
+			}
+		}
+		if(retryOfOk == false)
+		{
+			problems = problems + " Retry Of";
+		}
+	}
+	if(problems != "")
+	{
+		return "ERROR: retry run " + newId.toString() + " was created but left as Draft; verification failed for:" + problems;
+	}
+	c5 = Map();
+	c5.put("Status","Queued");
+	zoho.crm.updateRecord("Backfill_Runs",newId,c5);
+	chk2 = zoho.crm.getRecordById("Backfill_Runs",newId);
+	queuedOk = false;
+	if(chk2 != null)
+	{
+		if(ifnull(chk2.get("Status"),"").toString() == "Queued")
+		{
+			queuedOk = true;
+		}
+	}
+	return "CREATED retry run id=" + newId.toString() + " from run " + srcIdText + " ids=" + idList.size().toString() + " (failure rows=" + failRowCount.toString() + ", invalid=" + badCount.toString() + ") queued=" + queuedOk.toString() + " persistVerified=" + queuedOk.toString();
+}

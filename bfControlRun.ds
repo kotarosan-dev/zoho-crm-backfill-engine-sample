@@ -1,0 +1,176 @@
+string standalone.bf_controlRun(String runIdText, String actionText)
+{
+// Backfill engine - Run control (standalone) DRAFT v1, 2026-11-11 (Phase 2, TC-04 / TC-13)
+// Flag operations only; never starts the Runner and never writes to Leads / Deals.
+// actionText (case-insensitive):
+//   stop      Running / Queued / Paused_Budget / Paused_RateLimit -> Paused_Manual, Lock_Token cleared
+//   clearlock Lock_Token -> "" (any status; for a lock left behind by a crashed invocation)
+//   requeue   Paused_Budget / Paused_RateLimit / Paused_Manual / Paused_Failure -> Queued
+//             (refused while a lock is held: clear it first)
+//   cancel    any non-terminal status -> Cancelled, Lock_Token cleared
+//             (terminal = Completed / CompletedWithErrors / Failed / Cancelled; spec 13.1)
+// Any other status / action: nothing is written and the reason is returned.
+// A running Runner v2.0 honours stop / cancel at its next page boundary and again before its final persist.
+// Every applied action appends one audit line (JST ISO time) to Error_Summary.
+// Writes are grouped (Status, Lock_Token, Error_Summary separately) and read back.
+	runId = runIdText.toLong();
+	run = zoho.crm.getRecordById("Backfill_Runs",runId);
+	if(run == null)
+	{
+		return "ERROR: run not found";
+	}
+	action = "";
+	if(actionText != null)
+	{
+		action = actionText.trim().toLowerCase();
+	}
+	status = ifnull(run.get("Status"),"").toString();
+	lockVal = ifnull(run.get("Lock_Token"),"").toString();
+	// Corrected now (JST), same method as the Runner
+	rawNow = zoho.currenttime;
+	wallDate = rawNow.toDate();
+	wallYear = wallDate.toString("yyyy");
+	marBase = (wallYear + "-03-01").toDate();
+	dstStart = marBase;
+	novBase = (wallYear + "-11-01").toDate();
+	dstEnd = novBase;
+	probeSteps = {0,1,2,3,4,5,6};
+	for each ps in probeSteps
+	{
+		if(marBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstStart = marBase.addDay(ps).addDay(7);
+			break;
+		}
+	}
+	for each ps in probeSteps
+	{
+		if(novBase.addDay(ps).toString("EEEE") == "Sunday")
+		{
+			dstEnd = novBase.addDay(ps);
+			break;
+		}
+	}
+	shiftHours = 17;
+	if(wallDate >= dstStart && wallDate < dstEnd)
+	{
+		shiftHours = 16;
+	}
+	nowIsoJst = rawNow.addHour(shiftHours).toString("yyyy-MM-dd'T'HH:mm:ss") + "+09:00";
+	stopFrom = {"Running","Queued","Paused_Budget","Paused_RateLimit"};
+	requeueFrom = {"Paused_Budget","Paused_RateLimit","Paused_Manual","Paused_Failure"};
+	terminal = {"Completed","CompletedWithErrors","Failed","Cancelled"};
+	newStatus = "";
+	clearLock = false;
+	note = "";
+	if(action == "stop")
+	{
+		if(stopFrom.contains(status) == false)
+		{
+			return "NO CHANGE: stop is allowed only from Running, Queued, Paused Budget or Paused RateLimit; status is " + status;
+		}
+		newStatus = "Paused_Manual";
+		clearLock = true;
+	}
+	else if(action == "clearlock")
+	{
+		if(lockVal == "")
+		{
+			return "NO CHANGE: lock is already empty (status " + status + ")";
+		}
+		clearLock = true;
+		if(status == "Running")
+		{
+			note = " Status stays Running: use stop, then requeue, to resume.";
+		}
+	}
+	else if(action == "requeue")
+	{
+		if(requeueFrom.contains(status) == false)
+		{
+			return "NO CHANGE: requeue is allowed only from a Paused status; status is " + status;
+		}
+		if(lockVal != "")
+		{
+			return "NO CHANGE: lock is held (" + lockVal + "); run clearlock first if no invocation is active";
+		}
+		newStatus = "Queued";
+	}
+	else if(action == "cancel")
+	{
+		if(terminal.contains(status))
+		{
+			return "NO CHANGE: status " + status + " is terminal";
+		}
+		newStatus = "Cancelled";
+		clearLock = true;
+		note = " Records already written by this run stay as written (no rollback in v1).";
+	}
+	else
+	{
+		return "ERROR: unknown action [" + action + "]; use stop, clearlock, requeue or cancel";
+	}
+	// Group 1: Status
+	if(newStatus != "")
+	{
+		s1 = Map();
+		s1.put("Status",newStatus);
+		zoho.crm.updateRecord("Backfill_Runs",runId,s1);
+	}
+	// Group 2: Lock
+	if(clearLock && lockVal != "")
+	{
+		s2 = Map();
+		s2.put("Lock_Token","");
+		zoho.crm.updateRecord("Backfill_Runs",runId,s2);
+	}
+	// Group 3: audit line on Error_Summary (multi-line small, keep the newest 1,900 chars)
+	auditStatus = status;
+	if(newStatus != "")
+	{
+		auditStatus = status + " -> " + newStatus;
+	}
+	auditLine = "CONTROL " + action + " at " + nowIsoJst + ": " + auditStatus;
+	if(lockVal != "" && clearLock)
+	{
+		auditLine = auditLine + ", lock " + lockVal + " cleared";
+	}
+	oldSum = ifnull(run.get("Error_Summary"),"").toString();
+	newSum = auditLine;
+	if(oldSum != "")
+	{
+		newSum = oldSum + "\n" + auditLine;
+	}
+	if(newSum.length() > 1900)
+	{
+		cutFrom = newSum.length() - 1900;
+		newSum = newSum.subString(cutFrom,newSum.length());
+	}
+	s3 = Map();
+	s3.put("Error_Summary",newSum);
+	zoho.crm.updateRecord("Backfill_Runs",runId,s3);
+	// Read back
+	chk = zoho.crm.getRecordById("Backfill_Runs",runId);
+	persistOk = false;
+	backStatus = "";
+	if(chk != null)
+	{
+		backStatus = ifnull(chk.get("Status"),"").toString();
+		backLock = ifnull(chk.get("Lock_Token"),"").toString();
+		statusOk = true;
+		if(newStatus != "" && backStatus != newStatus)
+		{
+			statusOk = false;
+		}
+		lockOk = true;
+		if(clearLock && backLock != "")
+		{
+			lockOk = false;
+		}
+		if(statusOk && lockOk)
+		{
+			persistOk = true;
+		}
+	}
+	return "DONE " + action + ": " + auditStatus + " readBackStatus=" + backStatus + " persistVerified=" + persistOk.toString() + "." + note;
+}
